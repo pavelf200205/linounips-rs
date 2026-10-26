@@ -149,6 +149,15 @@ impl Ops {
             .max(1)
             .min(bh);
         let mut output = Tensor::<3>::empty([bh, n, d], self.options());
+        // Small calls are already covered by their enclosing layer/pixel bar.
+        let progress = (n >= 4096).then(|| {
+            crate::progress::phase(
+                "global attention",
+                bh.div_ceil(bs) * n.div_ceil(qs),
+                "query blocks",
+            )
+        });
+        let mut completed = 0;
         for bi in (0..bh).step_by(bs) {
             let be = (bi + bs).min(bh);
             let batch = be - bi;
@@ -183,6 +192,10 @@ impl Ops {
                 );
                 // Prevent asynchronous queues from retaining unbounded tile intermediates.
                 self.device.sync().expect("attention completion");
+                completed += 1;
+                if let Some(progress) = &progress {
+                    progress.set(completed);
+                }
             }
         }
         output.reshape([b, h, n, d])
@@ -219,6 +232,7 @@ impl Ops {
         let wy = upload(ya, [1, 1, size, 1], &self.device, FloatDType::F32);
         let wx = upload(xa, [1, 1, 1, size], &self.device, FloatDType::F32);
         let mut out = Tensor::<4>::empty([b, c, size, size], self.options());
+        let progress = (c >= 256).then(|| crate::progress::phase("interpolation", c, "channels"));
         for i in (0..c).step_by(16) {
             let e = (i + 16).min(c);
             let z = x
@@ -231,6 +245,9 @@ impl Ops {
             let z = a.clone() + (z.select(2, yh.clone()) - a) * wy.clone();
             out = out.slice_assign([0..b, i..e, 0..size, 0..size], z.cast(self.dtype));
             self.device.sync().expect("resize completion");
+            if let Some(progress) = &progress {
+                progress.set(e);
+            }
         }
         out
     }

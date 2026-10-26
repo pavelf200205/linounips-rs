@@ -84,6 +84,8 @@ impl Network {
                 .w::<1>(&format!("{p}.ls1.gamma"))
                 .reshape([1, 1, c]);
         let mut out = Tensor::<3>::empty([b, n, c], self.ops.options());
+        let progress =
+            (n >= 4096).then(|| crate::progress::phase("MLP", n.div_ceil(512), "chunks"));
         for start in (0..n).step_by(512) {
             let end = (start + 512).min(n);
             let orig = x.clone().slice([0..b, start..end, 0..c]);
@@ -96,12 +98,16 @@ impl Network {
                     .reshape([1, 1, c]);
             out = out.slice_assign([0..b, start..end, 0..c], orig + y);
             self.ops.device.sync().expect("MLP completion");
+            if let Some(progress) = &progress {
+                progress.set(start / 512 + 1);
+            }
         }
         out
     }
     fn blocks_batched(&self, x: Tensor<3>, p: &str, pos: &[[usize; 2]], batch: usize) -> Tensor<3> {
         let [b, n, c] = x.dims();
         let mut out = Tensor::<3>::empty([b, n, c], self.ops.options());
+        let progress = crate::progress::phase("transformer batches", b.div_ceil(batch), "batches");
         for start in (0..b).step_by(batch) {
             let end = (start + batch).min(b);
             let y = self.block(
@@ -112,6 +118,7 @@ impl Network {
             );
             out = out.slice_assign([start..end, 0..n, 0..c], y);
             self.ops.device.sync().expect("transformer completion");
+            progress.set(start / batch + 1);
         }
         out
     }
@@ -141,8 +148,10 @@ impl Network {
             ],
             1,
         );
+        let progress = crate::progress::phase("ViT", 12, "layers");
         for i in 0..12 {
             x = self.block(x, &format!("{p}.blocks.{i}"), None, 1e-6);
+            progress.set(i + 1);
         }
         let x = self.ops.norm(x, &format!("{p}.norm"), 1e-6);
         Tensor::cat(
@@ -154,9 +163,14 @@ impl Network {
         )
     }
     // Return four CPU-backed [stream,1031,1536] feature stages; no GPU stage list.
-    fn backbone(&self, streams: &[Packed]) -> Vec<Packed> {
+    fn backbone(&self, streams: &[Packed], branch: &str) -> Vec<Packed> {
         let n = streams.len();
         let mut x = Tensor::<3>::empty([n, 1031, 384], self.ops.options());
+        let dino_progress = crate::progress::phase(
+            format!("{branch}/DINO"),
+            n.div_ceil(self.encoder_batch),
+            "batches",
+        );
         for start in (0..n).step_by(self.encoder_batch) {
             let end = (start + self.encoder_batch).min(n);
             let mut data = Vec::with_capacity((end - start) * 3 * 256 * 256);
@@ -171,7 +185,9 @@ impl Network {
             ));
             x = x.slice_assign([start..end, 0..1031, 0..384], y);
             self.ops.device.sync().expect("DINO completion");
+            dino_progress.set(start / self.encoder_batch + 1);
         }
+        drop(dino_progress);
         let one: Vec<[usize; 2]> = (0..1031)
             .map(|i| {
                 if i < 7 {
@@ -189,17 +205,26 @@ impl Network {
         let mut stages = Vec::new();
         for i in 0..4 {
             if self.verbose {
-                eprintln!("  alternating-attention stage {}/4, {n} streams", i + 1);
+                crate::progress::message(format!(
+                    "  {branch}: alternating-attention stage {}/4, {n} streams",
+                    i + 1
+                ));
             }
+            let stage = crate::progress::phase(format!("{branch}/frame {}/4", i + 1), 1, "stage");
             let frame = self.blocks_batched(
                 x,
                 &format!("{A}.frame_blocks.{i}"),
                 &frame_pos,
                 self.encoder_batch,
             );
+            drop(stage);
+            let stage =
+                crate::progress::phase(format!("{branch}/light-axis-1 {}/4", i + 1), 1, "stage");
             let y = frame.clone().swap_dims(0, 1);
             let y = self.blocks_batched(y, &format!("{A}.light_axis_1_blocks.{i}"), &light_pos, 32);
             let light1 = y.swap_dims(0, 1);
+            drop(stage);
+            let stage = crate::progress::phase(format!("{branch}/global {}/4", i + 1), 1, "stage");
             let global = self
                 .block(
                     light1.clone().reshape([1, n * 1031, 384]),
@@ -208,11 +233,17 @@ impl Network {
                     1e-5,
                 )
                 .reshape([n, 1031, 384]);
+            drop(stage);
+            let stage =
+                crate::progress::phase(format!("{branch}/light-axis-2 {}/4", i + 1), 1, "stage");
             let y = global.clone().swap_dims(0, 1);
             let y = self.blocks_batched(y, &format!("{A}.light_axis_2_blocks.{i}"), &light_pos, 32);
             x = y.swap_dims(0, 1);
+            drop(stage);
             // Copy one stream at a time; never allocate a full four-way GPU concatenation.
             let mut packed = Vec::with_capacity(n * 1031 * 1536);
+            let progress =
+                crate::progress::phase(format!("{branch}/save features {}/4", i + 1), n, "streams");
             for f in 0..n {
                 let cat = Tensor::cat(
                     [&frame, &light1, &global, &x]
@@ -222,6 +253,7 @@ impl Network {
                     2,
                 );
                 packed.extend(read(cat));
+                progress.set(f + 1);
             }
             stages.push(Packed::new(packed, self.ops.dtype));
         }
@@ -280,6 +312,7 @@ impl Network {
         self.ops.conv(x, &format!("{p}.out_conv"), 1, 0)
     }
     fn fusion(&self, stages: &[Packed], stream: usize) -> Tensor<4> {
+        let progress = crate::progress::phase("fusion", 5, "layers");
         let mut features = Vec::new();
         for (layer, data) in stages.iter().enumerate() {
             let off = stream * 1031 * 1536 + 7 * 1536;
@@ -325,6 +358,7 @@ impl Network {
                 1,
             )));
             self.ops.device.sync().expect("fusion layer completion");
+            progress.set(layer + 1);
         }
         let l4 = features.pop().unwrap();
         let l3 = features.pop().unwrap();
@@ -335,7 +369,9 @@ impl Network {
         let x = self.refine(x, Some(l2), 2, 256);
         let x = self.refine(x, Some(l1), 1, 512);
         let x = self.ops.conv(x, &format!("{F}.scratch.output_conv1"), 2, 1);
-        self.position(x)
+        let x = self.position(x);
+        progress.set(5);
+        x
     }
     // Haar signs follow PyWavelets db1: LL, high-Y/low-X, low-Y/high-X, HH.
     fn wavelet(&self, x: &Packed) -> Vec<Packed> {
@@ -403,6 +439,7 @@ impl Network {
         )
     }
     pub fn encode(&self, images: &[Packed]) -> Vec<Packed> {
+        let preparation = crate::progress::phase("canonical/resize inputs", 1, "stage");
         let small: Vec<_> = images
             .iter()
             .map(|im| {
@@ -421,18 +458,26 @@ impl Network {
                 )
             })
             .collect();
-        let stages = self.backbone(&small);
+        drop(preparation);
+        let stages = self.backbone(&small, "canonical");
         drop(small);
         let mut result = Vec::with_capacity(images.len());
+        let fusion_progress = crate::progress::phase("canonical/fusion", images.len(), "lights");
         for f in 0..images.len() {
             let x = self.fusion(&stages, f);
             let x = self.ops.resize(x, 512, true);
             result.push(Packed::capture(x, self.ops.dtype));
+            fusion_progress.set(f + 1);
         }
+        drop(fusion_progress);
         drop(stages);
+        let preparation = crate::progress::phase("wavelet/prepare inputs", 1, "stage");
         let wavelets: Vec<_> = images.iter().flat_map(|im| self.wavelet(im)).collect();
-        let stages = self.backbone(&wavelets);
+        drop(preparation);
+        let stages = self.backbone(&wavelets, "wavelet");
         drop(wavelets);
+        let fusion_progress =
+            crate::progress::phase("wavelet/fusion and smoothing", images.len(), "lights");
         for f in 0..images.len() {
             let bands = (0..4).map(|k| self.fusion(&stages, f * 4 + k)).collect();
             let x = self.inverse(bands);
@@ -445,6 +490,7 @@ impl Network {
             let x = self.smooth(x + canonical);
             // Pixel-major host layout makes sample gathering contiguous across channels.
             result[f] = Packed::capture(x.permute([0, 2, 3, 1]), self.ops.dtype);
+            fusion_progress.set(f + 1);
         }
         result
     }

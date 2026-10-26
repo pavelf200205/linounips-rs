@@ -3,6 +3,7 @@ mod input;
 mod network;
 mod ops;
 mod output;
+mod progress;
 mod schema;
 use anyhow::{Context, Result, ensure};
 use burn::tensor::{Device, DeviceKind, FloatDType};
@@ -44,6 +45,9 @@ struct Cli {
     /// Print block timings and write profile.json (wall-clock timings, not device timestamps).
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
+    /// Disable terminal progress and periodic progress lines in redirected output.
+    #[arg(long, global = true)]
+    no_progress: bool,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -95,6 +99,7 @@ fn convert(input: &Path, out: &Path, python: &str) -> Result<()> {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    progress::configure(!cli.no_progress);
     if let Command::Convert { model, out, python } = &cli.command {
         return convert(model, out, python);
     }
@@ -232,14 +237,21 @@ fn main() -> Result<()> {
     objects.sort();
     ensure!(!objects.is_empty(), "No input objects");
     let mut rng = Rng::new(seed);
-    for object in objects {
+    let total_views = objects.len();
+    for (view_index, object) in objects.into_iter().enumerate() {
         let dir = if batch {
             out.join(object.file_name().unwrap())
         } else {
             out.clone()
         };
         std::fs::create_dir_all(&dir)?;
+        let view_name = object
+            .file_name()
+            .unwrap_or(object.as_os_str())
+            .to_string_lossy();
+        let view_progress = progress::view(&view_name, view_index + 1, total_views);
         let start = Instant::now();
+        let loading = progress::phase("load and normalize images", 1, "view");
         let input = Input::load(
             &object,
             images,
@@ -249,6 +261,7 @@ fn main() -> Result<()> {
             &normalization,
             &mut rng,
         )?;
+        drop(loading);
         let input_seconds = start.elapsed().as_secs_f64();
         let inference = Instant::now();
         let n = input.images.len();
@@ -261,14 +274,15 @@ fn main() -> Result<()> {
                 Map::new("metallic", 1, input.size),
             ]);
         }
-        eprintln!(
+        progress::message(format!(
             "{}: {n} lights, {}px, {} interleaved blocks",
             object.display(),
             input.size,
             grid * grid
-        );
+        ));
         let mut profile = Vec::new();
         for block in 0..grid * grid {
+            view_progress.block(block + 1, grid * grid);
             let began = Instant::now();
             let (rgb, mask) = input.block(block, dtype);
             let mut ids: Vec<usize> = mask
@@ -302,6 +316,7 @@ fn main() -> Result<()> {
             let base = ids.len() / groups;
             let extra = ids.len() % groups;
             let mut at = 0;
+            let decoding = progress::phase("decode sampled pixels", ids.len(), "pixels");
             for group in 0..groups {
                 let count = base + usize::from(group < extra);
                 let set = &ids[at..at + count];
@@ -336,21 +351,26 @@ fn main() -> Result<()> {
                             .copy_from_slice(&values[i * map.channels..(i + 1) * map.channels]);
                     }
                 }
+                // Readback above already completes the predictions. No new GPU wait.
+                decoding.set(at);
             }
+            drop(decoding);
             drop(features);
             let elapsed = began.elapsed().as_secs_f64();
             if cli.verbose {
-                eprintln!(
+                progress::message(format!(
                     "Block {}/{}: encoder {encode_seconds:.2}s, total {elapsed:.2}s",
                     block + 1,
                     grid * grid
-                );
+                ));
             }
             profile.push(serde_json::json!({"block":block,"encoder_seconds":encode_seconds,"seconds":elapsed,"foreground":ids.len()}));
         }
         let inference_seconds = inference.elapsed().as_secs_f64();
-        for map in &maps {
+        let saving = progress::phase("save output maps", maps.len(), "maps");
+        for (index, map) in maps.iter().enumerate() {
             output::save(map, &input, &dir, &formats)?;
+            saving.set(index + 1);
         }
         let metadata = serde_json::json!({"revision":env!("LINO_REVISION"),"upstream":"4ddb4113d0196b853978d2cc72de582611b01ebd","model":model,"mode":format!("{mode:?}"),"precision":format!("{dtype:?}"),"device":format!("{:?}",net.ops.device.identity()),"images":n,"size":input.size,"files":input.files,"roi":input.roi,"normalization":normalization,"seed":seed,"pixel_batch":cli.pixel_batch,"encoder_batch":cli.encoder_batch,"score_budget_mib":cli.score_budget_mib,"input_seconds":input_seconds,"inference_seconds":inference_seconds,"seconds":start.elapsed().as_secs_f64(),"material_mapping":"clamp(raw,-1,1)*0.5+0.5; diffuse is upstream baseColor","normal_axes":"upstream xyz","formats":formats});
         std::fs::write(
@@ -363,6 +383,8 @@ fn main() -> Result<()> {
                 serde_json::to_vec_pretty(&profile)?,
             )?;
         }
+        drop(saving);
+        view_progress.finish();
         println!(
             "Saved {} ({inference_seconds:.2}s inference)",
             dir.display()

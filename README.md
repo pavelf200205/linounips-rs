@@ -94,6 +94,30 @@ Use --formats exr or --formats png to select a subset. metadata.json records mod
 revision, precision, ROI, file selection, settings and wall times. --verbose adds
 block encoder/total timings and profile.json; these are not GPU timestamps.
 
+### Console progress
+
+Progress is enabled by default and follows SuperNormal's dependency-free stderr
+display: one carriage-return line, refreshed at most four times per second.
+It shows the view index/name, block index, canonical or wavelet branch, and the
+current stage. Counts cover DINO layers/batches, transformer batches, global
+attention query blocks, MLP chunks, fusion lights/layers, interpolation channels,
+decoded pixels and output maps. Nested stages preserve branch context.
+
+For example (the exact line is shortened to fit the terminal):
+
+~~~text
+View 1/20 view_00 block 1/4 | wavelet/global 2/4 / attention | [====----] 50% 73/145 q | 04:12 ETA ~00:20
+~~~
+
+Percentages and estimated remaining times refer to the current stage, not the
+whole view. An ETA appears after two completed work units and can fluctuate,
+particularly during first-use compilation/tuning. Elapsed time keeps updating
+during long calls even if the completion counter has not moved. No GPU waits or
+tensor readbacks are added for progress. Verbose messages clear the live line;
+redirected output uses plain snapshots every 15 seconds plus view completion.
+Use --no-progress to disable the bar/heartbeat and periodic snapshots. Ordinary
+result messages and optional --verbose reports remain available.
+
 ## Memory changes
 
 * All global attention retains all lights and all wavelet streams. Online softmax
