@@ -5,11 +5,22 @@ use burn::tensor::{
     ops::{ConvOptions, ConvTransposeOptions},
 };
 use safetensors::{Dtype, SafeTensors};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    path::Path,
+};
 pub struct Ops {
     pub device: Device,
     pub dtype: FloatDType,
     pub score_mib: usize,
+    pub reference_kernels: bool,
+    pub inflight_mib: usize,
+    pending_bytes: Cell<usize>,
+    pending_ops: Cell<usize>,
+    constants: RefCell<BTreeMap<String, Tensor<1>>>,
+    constant_bytes: Cell<usize>,
+    timings: RefCell<BTreeMap<&'static str, (u64, f64)>>,
     weights: BTreeMap<String, (Vec<usize>, Tensor<1>)>,
 }
 impl Ops {
@@ -40,7 +51,7 @@ impl Ops {
         );
         let expected = crate::schema::expected(pbr);
         let mut weights = BTreeMap::new();
-        for (name, shape) in expected {
+        for (name, mut shape) in expected {
             let t = archive.tensor(&name).with_context(|| {
                 format!("Missing required tensor {name}; wrong checkpoint mode or architecture")
             })?;
@@ -49,7 +60,7 @@ impl Ops {
                 "{name}: expected {shape:?}, got {:?}",
                 t.shape()
             );
-            let v: Vec<f32> = match t.dtype() {
+            let mut v: Vec<f32> = match t.dtype() {
                 Dtype::F32 => t
                     .data()
                     .chunks_exact(4)
@@ -72,14 +83,39 @@ impl Ops {
                 _ => anyhow::bail!("Unsupported dtype for {name}"),
             };
             ensure!(v.iter().all(|v| v.is_finite()), "Nonfinite tensor {name}");
+            // Store linear weights in GEMM layout once, without a duplicate GPU copy.
+            if shape.len() == 2 {
+                let (o, i) = (shape[0], shape[1]);
+                let mut transposed = vec![0.; v.len()];
+                for row in 0..o {
+                    for col in 0..i {
+                        transposed[col * o + row] = v[row * i + col];
+                    }
+                }
+                v = transposed;
+                shape = vec![i, o];
+            }
             let n = v.len();
-            weights.insert(name, (shape, upload(v, [n], &device, dtype)));
+            let mut tensor = upload(v, [n], &device, dtype);
+            if shape.len() == 1
+                && (name.contains("norm") || name.contains(".ln0.") || name.contains(".ln1."))
+            {
+                tensor = tensor.cast(FloatDType::F32);
+            }
+            weights.insert(name, (shape, tensor));
         }
         Ok(Self {
             device,
             dtype,
             score_mib,
             weights,
+            reference_kernels: false,
+            inflight_mib: 64,
+            pending_bytes: Cell::new(0),
+            pending_ops: Cell::new(0),
+            constants: RefCell::new(BTreeMap::new()),
+            constant_bytes: Cell::new(0),
+            timings: RefCell::new(BTreeMap::new()),
         })
     }
     pub fn options(&self) -> TensorCreationOptions {
@@ -94,15 +130,28 @@ impl Ops {
         self.weights.contains_key(key)
     }
     pub fn linear(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
+        let _timer = self.span("linear");
         let [b, n, c] = x.dims();
         let w: Tensor<2> = self.w(&format!("{p}.weight"));
-        let o = w.dims()[0];
+        let o = w.dims()[1];
         let bias = self
             .has(&format!("{p}.bias"))
             .then(|| self.w::<1>(&format!("{p}.bias")));
-        module::linear(x.reshape([b * n, c]), w.transpose(), bias).reshape([b, n, o])
+        module::linear(x.reshape([b * n, c]), w, bias).reshape([b, n, o])
     }
     pub fn norm<const D: usize>(&self, x: Tensor<D>, p: &str, eps: f64) -> Tensor<D> {
+        let _timer = self.span("layer_norm");
+        if !self.reference_kernels {
+            if let Some(out) = crate::fast_norm::forward(
+                x.clone(),
+                self.w::<1>(&format!("{p}.weight")),
+                self.w::<1>(&format!("{p}.bias")),
+                eps,
+            ) {
+                self.schedule(x.dims().iter().product::<usize>() * 2);
+                return out;
+            }
+        }
         module::layer_norm(
             x.cast(FloatDType::F32),
             self.w::<1>(&format!("{p}.weight")).cast(FloatDType::F32),
@@ -112,6 +161,7 @@ impl Ops {
         .cast(self.dtype)
     }
     pub fn conv(&self, x: Tensor<4>, p: &str, stride: usize, pad: usize) -> Tensor<4> {
+        let _timer = self.span("conv");
         let bias = self
             .has(&format!("{p}.bias"))
             .then(|| self.w::<1>(&format!("{p}.bias")));
@@ -123,6 +173,7 @@ impl Ops {
         )
     }
     pub fn deconv(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
+        let _timer = self.span("transpose_conv");
         module::conv_transpose2d(
             x,
             self.w(&format!("{p}.weight")),
@@ -137,7 +188,16 @@ impl Ops {
     // Online softmax over ALL keys. Query/key blocking never changes the receptive field.
     // FP32 statistics and accumulators; score_mib reserves headroom for score temporaries.
     pub fn attention(&self, q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scale: f64) -> Tensor<4> {
+        let _timer = self.span("attention");
         let [b, h, n, d] = q.dims();
+        if !self.reference_kernels {
+            if let Some(out) =
+                crate::fast_attention::forward(q.clone(), k.clone(), v.clone(), scale)
+            {
+                self.schedule(b * h * n * d * 8);
+                return out;
+            }
+        }
         let m = k.dims()[2];
         let bh = b * h;
         let q = q.reshape([bh, n, d]);
@@ -191,7 +251,7 @@ impl Ops {
                     (acc / sum.clamp_min(1e-20)).cast(self.dtype),
                 );
                 // Prevent asynchronous queues from retaining unbounded tile intermediates.
-                self.device.sync().expect("attention completion");
+                self.schedule(batch * count * (ks * 24 + d * 16));
                 completed += 1;
                 if let Some(progress) = &progress {
                     progress.set(completed);
@@ -202,7 +262,14 @@ impl Ops {
     }
     // FP32 bilinear interpolation in bounded channel slices, then cast immediately.
     pub fn resize(&self, x: Tensor<4>, size: usize, align: bool) -> Tensor<4> {
+        let _timer = self.span("resize");
         let [b, c, h, w] = x.dims();
+        if !self.reference_kernels && (h != size || w != size) {
+            if let Some(out) = crate::geometry::resize(x.clone(), size, align) {
+                self.schedule(b * c * size * size * 2);
+                return out;
+            }
+        }
         if h == size && w == size {
             return x;
         }
@@ -244,7 +311,7 @@ impl Ops {
             let a = z.clone().select(2, yl.clone());
             let z = a.clone() + (z.select(2, yh.clone()) - a) * wy.clone();
             out = out.slice_assign([0..b, i..e, 0..size, 0..size], z.cast(self.dtype));
-            self.device.sync().expect("resize completion");
+            self.schedule(b * (e - i) * size * size * 20);
             if let Some(progress) = &progress {
                 progress.set(e);
             }
@@ -253,5 +320,232 @@ impl Ops {
     }
     pub fn leaky(&self, x: Tensor<4>) -> Tensor<4> {
         activation::leaky_relu(x, 0.01)
+    }
+    // Budget queued temporary work; live model/output tensors are separate.
+    pub fn schedule(&self, bytes: usize) {
+        let pending = self.pending_bytes.get().saturating_add(bytes);
+        let ops = self.pending_ops.get() + 1;
+        self.pending_bytes.set(pending);
+        self.pending_ops.set(ops);
+        if pending >= self.inflight_mib * 1024 * 1024 || ops >= 32 {
+            let _wait = self.span("queue_wait");
+            self.device.sync().expect("bounded queue completion");
+            self.pending_bytes.set(0);
+            self.pending_ops.set(0);
+        } else if ops % 4 == 0 {
+            self.device.flush().expect("GPU submission");
+        }
+    }
+    pub fn boundary(&self) {
+        self.device.flush().expect("GPU submission");
+    }
+    pub fn trim_after_readback(&self) {
+        self.pending_bytes.set(0);
+        self.pending_ops.set(0);
+        if let Some(u) = self.device.memory_pool_usage() {
+            let unused = u
+                .bytes_reserved
+                .saturating_sub(u.bytes_in_use)
+                .saturating_sub(u.bytes_padding);
+            if unused > 256 * 1024 * 1024 {
+                self.device.sync().expect("allocator boundary");
+                self.device.memory_cleanup();
+            }
+        }
+    }
+    pub fn constant(&self, key: String, values: impl FnOnce() -> Vec<f32>) -> Tensor<1> {
+        self.constant_as(key, FloatDType::F32, values)
+    }
+    pub fn constant_as(
+        &self,
+        key: String,
+        dtype: FloatDType,
+        values: impl FnOnce() -> Vec<f32>,
+    ) -> Tensor<1> {
+        if let Some(t) = self.constants.borrow().get(&key) {
+            return t.clone();
+        }
+        let v = values();
+        let bytes = v.len() * if dtype == FloatDType::F32 { 4 } else { 2 };
+        let n = v.len();
+        let t = upload(v, [n], &self.device, dtype);
+        if bytes <= 16 * 1024 * 1024 {
+            if self.constant_bytes.get() + bytes > 16 * 1024 * 1024 {
+                self.constants.borrow_mut().clear();
+                self.constant_bytes.set(0);
+            }
+            self.constants.borrow_mut().insert(key, t.clone());
+            self.constant_bytes.set(self.constant_bytes.get() + bytes);
+        }
+        t
+    }
+    pub fn position(&self, x: Tensor<4>) -> Tensor<4> {
+        let _timer = self.span("position_embedding");
+        let [b, c, h, w] = x.dims();
+        let length = h.max(w);
+        let lut = self.constant(format!("position/{c}/{h}/{w}"), || {
+            let mut lut = Vec::with_capacity(c * length);
+            for ch in 0..c {
+                let quarter = c / 4;
+                let axis = ch / (c / 2);
+                let cosine = ch % (c / 2) >= quarter;
+                let n = if axis == 0 { w } else { h };
+                let frequency = 100f64.powf(-((ch % quarter) as f64) / quarter as f64);
+                for j in 0..length {
+                    let coordinate = (2. * j as f64 + 1. - n as f64) / (n as f64 * 2f64.sqrt());
+                    let coordinate = match self.dtype {
+                        FloatDType::BF16 => half::bf16::from_f32(coordinate as f32).to_f32() as f64,
+                        FloatDType::F16 => half::f16::from_f32(coordinate as f32).to_f32() as f64,
+                        _ => coordinate,
+                    };
+                    let angle = coordinate * frequency;
+                    lut.push(0.1 * (if cosine { angle.cos() } else { angle.sin() }) as f32);
+                }
+            }
+            lut
+        });
+        if !self.reference_kernels {
+            if let Some(out) = crate::geometry::add_position(x.clone(), lut.clone()) {
+                self.schedule(b * c * h * w * 2);
+                return out;
+            }
+        }
+        let mut out = Tensor::<4>::empty([b, c, h, w], self.options());
+        for ch in (0..c).step_by(16) {
+            let end = (ch + 16).min(c);
+            let axis = if ch < c / 2 { w } else { h };
+            let values =
+                lut.clone()
+                    .slice([ch * length..end * length])
+                    .reshape([1, end - ch, 1, axis]);
+            let values = if ch < c / 2 {
+                values
+            } else {
+                values.swap_dims(2, 3)
+            };
+            let part = x
+                .clone()
+                .slice([0..b, ch..end, 0..h, 0..w])
+                .cast(FloatDType::F32)
+                + values;
+            out = out.slice_assign([0..b, ch..end, 0..h, 0..w], part.cast(self.dtype));
+            self.schedule(b * (end - ch) * h * w * 8);
+        }
+        out
+    }
+    pub fn rotary(&self, x: Tensor<4>, positions: &[[usize; 2]]) -> Tensor<4> {
+        let _timer = self.span("rotary");
+        let [b, _, n, d] = x.dims();
+        let half = d / 2;
+        let quarter = d / 4;
+        let maximum = positions.iter().flatten().copied().max().unwrap_or(0);
+        let lut = self.constant(format!("rope/lut/{d}/{maximum}"), || {
+            let mut v = Vec::new();
+            for p in 0..=maximum {
+                for j in 0..half {
+                    let angle = p as f32 / 100f32.powf(2. * (j % quarter) as f32 / half as f32);
+                    let angle = match self.dtype {
+                        FloatDType::BF16 => half::bf16::from_f32(angle).to_f32(),
+                        FloatDType::F16 => half::f16::from_f32(angle).to_f32(),
+                        _ => angle,
+                    };
+                    let round = |v: f32| match self.dtype {
+                        FloatDType::BF16 => half::bf16::from_f32(v).to_f32(),
+                        FloatDType::F16 => half::f16::from_f32(v).to_f32(),
+                        _ => v,
+                    };
+                    v.extend([round(angle.cos()), round(angle.sin())]);
+                }
+            }
+            v
+        });
+        let mut hash = 0xcbf29ce484222325u64;
+        for p in positions {
+            for v in p {
+                hash = (hash ^ (*v as u64)).wrapping_mul(0x100000001b3);
+            }
+        }
+        let pos = self.constant(format!("rope/positions/{b}/{n}/{hash}"), || {
+            positions.iter().flat_map(|p| p.map(|x| x as f32)).collect()
+        });
+        if !self.reference_kernels {
+            if let Some(out) = crate::geometry::rope(x.clone(), lut.clone(), pos) {
+                self.schedule(b * n * d * 4);
+                return out;
+            }
+        }
+        let lookup = lut.into_data().try_into_vec::<f32>().expect("rope LUT");
+        let mut cos = Vec::new();
+        let mut sin = Vec::new();
+        for p in positions {
+            for axis in 0..2 {
+                for j in 0..half {
+                    let at = (p[axis] * half + j) * 2;
+                    cos.push(lookup[at]);
+                    sin.push(lookup[at + 1]);
+                }
+            }
+        }
+        let cos = upload(cos, [b, 1, n, d], &self.device, self.dtype);
+        let sin = upload(sin, [b, 1, n, d], &self.device, self.dtype);
+        let heads = x.dims()[1];
+        let mut parts = Vec::new();
+        for axis in 0..2 {
+            let start = axis * half;
+            parts.push(
+                -x.clone()
+                    .slice([0..b, 0..heads, 0..n, start + quarter..start + half]),
+            );
+            parts.push(
+                x.clone()
+                    .slice([0..b, 0..heads, 0..n, start..start + quarter]),
+            );
+        }
+        x * cos + Tensor::cat(parts, 3) * sin
+    }
+    pub fn capture<const D: usize>(&self, x: Tensor<D>) -> crate::host::Packed {
+        let _timer = self.span("feature_readback");
+        let data = crate::host::Packed::capture(x, self.dtype);
+        self.pending_bytes.set(0);
+        self.pending_ops.set(0);
+        data
+    }
+    pub fn span(&self, label: &'static str) -> Timer<'_> {
+        Timer {
+            ops: self,
+            label,
+            start: std::time::Instant::now(),
+        }
+    }
+    pub fn reset_timings(&self) {
+        self.timings.borrow_mut().clear();
+    }
+    pub fn timing_report(&self) -> serde_json::Value {
+        let entries = self
+            .timings
+            .borrow()
+            .iter()
+            .map(|(name, (calls, seconds))| {
+                (
+                    (*name).to_owned(),
+                    serde_json::json!({"calls":calls,"inclusive_wall_seconds":seconds}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::Value::Object(entries)
+    }
+}
+
+pub struct Timer<'a> {
+    ops: &'a Ops,
+    label: &'static str,
+    start: std::time::Instant,
+}
+impl Drop for Timer<'_> {
+    fn drop(&mut self) {
+        let mut timings = self.ops.timings.borrow_mut();
+        let entry = timings.entry(self.label).or_insert((0, 0.));
+        entry.0 += 1;
+        entry.1 += self.start.elapsed().as_secs_f64();
     }
 }

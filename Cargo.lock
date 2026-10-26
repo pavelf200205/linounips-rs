@@ -3814,9 +3814,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-backend",
+ "burn-cubecl",
+ "burn-fusion",
  "clap",
  "cubecl",
  "cubecl-environment",
+ "cubek",
  "half",
  "image",
  "safetensors 0.6.2",

@@ -1,3 +1,6 @@
+mod fast_attention;
+mod fast_norm;
+mod geometry;
 mod host;
 mod input;
 mod network;
@@ -34,14 +37,20 @@ struct Cli {
     #[arg(long,global=true,default_value="auto",value_parser=["auto","bf16","fp16","fp32"])]
     precision: String,
     /// Independent per-image encoder batch; global attention always sees every light.
-    #[arg(long, global = true, default_value_t = 1)]
+    #[arg(long, global = true, default_value_t = 2)]
     encoder_batch: usize,
     /// Semantic pixel sampling group size. Changing this may change predictions.
     #[arg(long, global = true, default_value_t = 2048)]
     pixel_batch: usize,
-    /// Approximate score-temporary budget; excludes model weights and live features.
+    /// GEMM fallback score-temporary budget; fused attention does not allocate dense scores.
     #[arg(long, global = true, default_value_t = 64)]
     score_budget_mib: usize,
+    /// Estimated queued temporary-work budget; live model/features are separate.
+    #[arg(long, global = true, default_value_t = 64)]
+    inflight_mib: usize,
+    /// Use the tensor-operation fallbacks for attention, geometry and LayerNorm.
+    #[arg(long, global = true)]
+    reference_kernels: bool,
     /// Print block timings and write profile.json (wall-clock timings, not device timestamps).
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
@@ -106,6 +115,8 @@ fn main() -> Result<()> {
     ensure!(
         cli.encoder_batch > 0
             && cli.pixel_batch > 0
+            && cli.inflight_mib > 0
+            && cli.inflight_mib <= 16384
             && cli.score_budget_mib > 0
             && cli.score_budget_mib <= 16384,
         "Batch sizes and memory budget must be positive (budget <=16384 MiB)"
@@ -220,8 +231,11 @@ fn main() -> Result<()> {
         model.clone()
     };
     let pbr = matches!(mode, Mode::Pbr);
+    let mut ops = ops::Ops::load(&checkpoint, device, dtype, cli.score_budget_mib, pbr)?;
+    ops.reference_kernels = cli.reference_kernels;
+    ops.inflight_mib = cli.inflight_mib;
     let net = network::Network {
-        ops: ops::Ops::load(&checkpoint, device, dtype, cli.score_budget_mib, pbr)?,
+        ops,
         pbr,
         encoder_batch: cli.encoder_batch,
         verbose: cli.verbose,
@@ -263,6 +277,7 @@ fn main() -> Result<()> {
         )?;
         drop(loading);
         let input_seconds = start.elapsed().as_secs_f64();
+        net.ops.reset_timings();
         let inference = Instant::now();
         let n = input.images.len();
         let grid = input.size / 512;
@@ -317,6 +332,7 @@ fn main() -> Result<()> {
             let extra = ids.len() % groups;
             let mut at = 0;
             let decoding = progress::phase("decode sampled pixels", ids.len(), "pixels");
+            let mut prefetched = None;
             for group in 0..groups {
                 let count = base + usize::from(group < extra);
                 let set = &ids[at..at + count];
@@ -324,22 +340,27 @@ fn main() -> Result<()> {
                 if count == 0 {
                     continue;
                 }
-                let mut f = Vec::with_capacity(count * n * 256);
-                let mut colors = Vec::with_capacity(count * n * 3);
-                for &pixel in set {
-                    for light in 0..n {
-                        for c in 0..256 {
-                            f.push(features[light].get(pixel * 256 + c));
-                        }
-                        for c in 0..3 {
-                            colors.push(rgb[light].get(c * 512 * 512 + pixel));
-                        }
-                    }
-                }
+                let (colors, f) = prefetched
+                    .take()
+                    .unwrap_or_else(|| gather_inputs(&rgb, &features, set, dtype));
                 let predictions = net.decode(
                     upload(colors, [count, n, 3], &net.ops.device, dtype),
-                    upload(f, [count, n, 256], &net.ops.device, dtype),
+                    f.into_tensor([count, n, 256], &net.ops.device),
                 );
+                // Submit the current GPU work, then gather the next CPU batch while
+                // it runs. Only host buffers are double-buffered, not dense GPU maps.
+                net.ops.boundary();
+                if group + 1 < groups {
+                    let next_count = base + usize::from(group + 1 < extra);
+                    if next_count > 0 {
+                        prefetched = Some(gather_inputs(
+                            &rgb,
+                            &features,
+                            &ids[at..at + next_count],
+                            dtype,
+                        ));
+                    }
+                }
                 for (name, tensor) in predictions {
                     let values = read(tensor);
                     let map = maps.iter_mut().find(|m| m.name == name).unwrap();
@@ -356,6 +377,7 @@ fn main() -> Result<()> {
             }
             drop(decoding);
             drop(features);
+            net.ops.trim_after_readback();
             let elapsed = began.elapsed().as_secs_f64();
             if cli.verbose {
                 progress::message(format!(
@@ -372,7 +394,7 @@ fn main() -> Result<()> {
             output::save(map, &input, &dir, &formats)?;
             saving.set(index + 1);
         }
-        let metadata = serde_json::json!({"revision":env!("LINO_REVISION"),"upstream":"4ddb4113d0196b853978d2cc72de582611b01ebd","model":model,"mode":format!("{mode:?}"),"precision":format!("{dtype:?}"),"device":format!("{:?}",net.ops.device.identity()),"images":n,"size":input.size,"files":input.files,"roi":input.roi,"normalization":normalization,"seed":seed,"pixel_batch":cli.pixel_batch,"encoder_batch":cli.encoder_batch,"score_budget_mib":cli.score_budget_mib,"input_seconds":input_seconds,"inference_seconds":inference_seconds,"seconds":start.elapsed().as_secs_f64(),"material_mapping":"clamp(raw,-1,1)*0.5+0.5; diffuse is upstream baseColor","normal_axes":"upstream xyz","formats":formats});
+        let metadata = serde_json::json!({"revision":env!("LINO_REVISION"),"upstream":"4ddb4113d0196b853978d2cc72de582611b01ebd","model":model,"mode":format!("{mode:?}"),"precision":format!("{dtype:?}"),"device":format!("{:?}",net.ops.device.identity()),"images":n,"size":input.size,"files":input.files,"roi":input.roi,"normalization":normalization,"seed":seed,"pixel_batch":cli.pixel_batch,"encoder_batch":cli.encoder_batch,"score_budget_mib":cli.score_budget_mib,"inflight_mib":cli.inflight_mib,"reference_kernels":cli.reference_kernels,"attention_dispatch_totals":fast_attention::stats(),"operation_timings":net.ops.timing_report(),"input_seconds":input_seconds,"inference_seconds":inference_seconds,"seconds":start.elapsed().as_secs_f64(),"material_mapping":"clamp(raw,-1,1)*0.5+0.5; diffuse is upstream baseColor","normal_axes":"upstream xyz","formats":formats});
         std::fs::write(
             dir.join("metadata.json"),
             serde_json::to_vec_pretty(&metadata)?,
@@ -380,7 +402,9 @@ fn main() -> Result<()> {
         if cli.verbose {
             std::fs::write(
                 dir.join("profile.json"),
-                serde_json::to_vec_pretty(&profile)?,
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"blocks":profile,"operations":net.ops.timing_report(),"timing_kind":"inclusive CPU wall time, includes waits when encountered; nested entries overlap"}),
+                )?,
             )?;
         }
         drop(saving);
@@ -391,4 +415,24 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn gather_inputs(
+    rgb: &[Packed],
+    features: &[Packed],
+    pixels: &[usize],
+    dtype: FloatDType,
+) -> (Vec<f32>, Packed) {
+    let n = rgb.len();
+    let mut packed = Packed::empty(dtype, pixels.len() * n * 256);
+    let mut colors = Vec::with_capacity(pixels.len() * n * 3);
+    for &pixel in pixels {
+        for light in 0..n {
+            packed.extend_range(&features[light], pixel * 256..(pixel + 1) * 256);
+            for c in 0..3 {
+                colors.push(rgb[light].get(c * 512 * 512 + pixel));
+            }
+        }
+    }
+    (colors, packed)
 }

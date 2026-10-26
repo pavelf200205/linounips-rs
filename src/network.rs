@@ -1,8 +1,5 @@
 //! Released LINO graph, with CPU-backed stage features and per-light fusion.
-use crate::{
-    host::{Packed, read, upload},
-    ops::Ops,
-};
+use crate::{host::Packed, ops::Ops};
 use burn::tensor::{
     FloatDType, Tensor, activation, module,
     ops::{ConvOptions, ConvTransposeOptions},
@@ -16,41 +13,6 @@ pub struct Network {
     pub verbose: bool,
 }
 impl Network {
-    fn rope(&self, x: Tensor<4>, pos: &[[usize; 2]]) -> Tensor<4> {
-        let [b, h, n, d] = x.dims();
-        assert_eq!(pos.len(), b * n);
-        let half = d / 2;
-        let quarter = d / 4;
-        let mut c = Vec::with_capacity(b * n * d);
-        let mut s = Vec::with_capacity(b * n * d);
-        for p in pos {
-            for axis in 0..2 {
-                for j in 0..half {
-                    let angle =
-                        p[axis] as f32 / 100f32.powf(2.0 * (j % quarter) as f32 / half as f32);
-                    let angle = match self.ops.dtype {
-                        FloatDType::BF16 => half::bf16::from_f32(angle).to_f32(),
-                        FloatDType::F16 => half::f16::from_f32(angle).to_f32(),
-                        _ => angle,
-                    };
-                    c.push(angle.cos());
-                    s.push(angle.sin());
-                }
-            }
-        }
-        let cos = upload(c, [b, 1, n, d], &self.ops.device, self.ops.dtype);
-        let sin = upload(s, [b, 1, n, d], &self.ops.device, self.ops.dtype);
-        let mut parts = Vec::new();
-        for a in 0..2 {
-            let start = a * half;
-            parts.push(
-                -x.clone()
-                    .slice([0..b, 0..h, 0..n, start + quarter..start + half]),
-            );
-            parts.push(x.clone().slice([0..b, 0..h, 0..n, start..start + quarter]));
-        }
-        x * cos + Tensor::cat(parts, 3) * sin
-    }
     fn block(&self, x: Tensor<3>, p: &str, pos: Option<&[[usize; 2]]>, eps: f64) -> Tensor<3> {
         let [b, n, c] = x.dims();
         let z = self.ops.norm(x.clone(), &format!("{p}.norm1"), eps);
@@ -70,8 +32,8 @@ impl Network {
             k = self.ops.norm(k, &format!("{p}.attn.k_norm"), 1e-5);
         }
         if let Some(pos) = pos {
-            q = self.rope(q, pos);
-            k = self.rope(k, pos);
+            q = self.ops.rotary(q, pos);
+            k = self.ops.rotary(k, pos);
         }
         let attn = self
             .ops
@@ -97,7 +59,7 @@ impl Network {
                     .w::<1>(&format!("{p}.ls2.gamma"))
                     .reshape([1, 1, c]);
             out = out.slice_assign([0..b, start..end, 0..c], orig + y);
-            self.ops.device.sync().expect("MLP completion");
+            self.ops.schedule(b * (end - start) * c * 16);
             if let Some(progress) = &progress {
                 progress.set(start / 512 + 1);
             }
@@ -117,7 +79,7 @@ impl Network {
                 1e-5,
             );
             out = out.slice_assign([start..end, 0..n, 0..c], y);
-            self.ops.device.sync().expect("transformer completion");
+            self.ops.boundary();
             progress.set(start / batch + 1);
         }
         out
@@ -164,6 +126,7 @@ impl Network {
     }
     // Return four CPU-backed [stream,1031,1536] feature stages; no GPU stage list.
     fn backbone(&self, streams: &[Packed], branch: &str) -> Vec<Packed> {
+        let _timer = self.ops.span("backbone");
         let n = streams.len();
         let mut x = Tensor::<3>::empty([n, 1031, 384], self.ops.options());
         let dino_progress = crate::progress::phase(
@@ -173,18 +136,13 @@ impl Network {
         );
         for start in (0..n).step_by(self.encoder_batch) {
             let end = (start + self.encoder_batch).min(n);
-            let mut data = Vec::with_capacity((end - start) * 3 * 256 * 256);
+            let mut data = Packed::empty(self.ops.dtype, (end - start) * 3 * 256 * 256);
             for image in &streams[start..end] {
-                data.extend(image.range(0..image.len()));
+                data.extend_range(image, 0..image.len());
             }
-            let y = self.dino(upload(
-                data,
-                [end - start, 3, 256, 256],
-                &self.ops.device,
-                self.ops.dtype,
-            ));
+            let y = self.dino(data.into_tensor([end - start, 3, 256, 256], &self.ops.device));
             x = x.slice_assign([start..end, 0..1031, 0..384], y);
-            self.ops.device.sync().expect("DINO completion");
+            self.ops.boundary();
             dino_progress.set(start / self.encoder_batch + 1);
         }
         drop(dino_progress);
@@ -241,7 +199,7 @@ impl Network {
             x = y.swap_dims(0, 1);
             drop(stage);
             // Copy one stream at a time; never allocate a full four-way GPU concatenation.
-            let mut packed = Vec::with_capacity(n * 1031 * 1536);
+            let mut packed = Packed::empty(self.ops.dtype, n * 1031 * 1536);
             let progress =
                 crate::progress::phase(format!("{branch}/save features {}/4", i + 1), n, "streams");
             for f in 0..n {
@@ -252,38 +210,12 @@ impl Network {
                         .collect(),
                     2,
                 );
-                packed.extend(read(cat));
+                packed.append(self.ops.capture(cat));
                 progress.set(f + 1);
             }
-            stages.push(Packed::new(packed, self.ops.dtype));
+            stages.push(packed);
         }
         stages
-    }
-    fn position(&self, x: Tensor<4>) -> Tensor<4> {
-        let [_, c, h, w] = x.dims();
-        let mut p = vec![0.; c * h * w];
-        for ch in 0..c {
-            let quarter = c / 4;
-            let axis = ch / (c / 2);
-            let cosine = (ch % (c / 2)) >= quarter;
-            let freq = 100f64.powf(-((ch % quarter) as f64) / quarter as f64);
-            for y in 0..h {
-                for xx in 0..w {
-                    let (j, n) = if axis == 0 { (xx, w) } else { (y, h) };
-                    let coord = (2. * j as f64 + 1. - n as f64) / (n as f64 * 2f64.sqrt());
-                    let coord = match self.ops.dtype {
-                        FloatDType::BF16 => half::bf16::from_f32(coord as f32).to_f32() as f64,
-                        FloatDType::F16 => half::f16::from_f32(coord as f32).to_f32() as f64,
-                        _ => coord,
-                    };
-                    let a = coord * freq;
-                    p[(ch * h + y) * w + xx] =
-                        0.1 * (if cosine { a.cos() } else { a.sin() }) as f32;
-                }
-            }
-        }
-        (x.cast(FloatDType::F32) + upload(p, [1, c, h, w], &self.ops.device, FloatDType::F32))
-            .cast(self.ops.dtype)
     }
     fn residual(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
         let y = self
@@ -312,16 +244,12 @@ impl Network {
         self.ops.conv(x, &format!("{p}.out_conv"), 1, 0)
     }
     fn fusion(&self, stages: &[Packed], stream: usize) -> Tensor<4> {
+        let _timer = self.ops.span("fusion");
         let progress = crate::progress::phase("fusion", 5, "layers");
         let mut features = Vec::new();
         for (layer, data) in stages.iter().enumerate() {
             let off = stream * 1031 * 1536 + 7 * 1536;
-            let x = upload(
-                data.range(off..off + 1024 * 1536),
-                [1, 1024, 1536],
-                &self.ops.device,
-                self.ops.dtype,
-            );
+            let x = data.upload_range(off..off + 1024 * 1536, [1, 1024, 1536], &self.ops.device);
             let x = self
                 .ops
                 .norm(x, &format!("{F}.norm"), 1e-5)
@@ -332,7 +260,7 @@ impl Network {
             let x = self
                 .ops
                 .leaky(self.ops.conv(x, &format!("{F}.projects.{layer}.0"), 1, 0));
-            let x = self.position(x);
+            let x = self.ops.position(x);
             let x = if layer < 2 {
                 let x = self
                     .ops
@@ -357,7 +285,7 @@ impl Network {
                 1,
                 1,
             )));
-            self.ops.device.sync().expect("fusion layer completion");
+            self.ops.schedule(x_bytes_for_fusion(layer));
             progress.set(layer + 1);
         }
         let l4 = features.pop().unwrap();
@@ -369,7 +297,7 @@ impl Network {
         let x = self.refine(x, Some(l2), 2, 256);
         let x = self.refine(x, Some(l1), 1, 512);
         let x = self.ops.conv(x, &format!("{F}.scratch.output_conv1"), 2, 1);
-        let x = self.position(x);
+        let x = self.ops.position(x);
         progress.set(5);
         x
     }
@@ -398,39 +326,43 @@ impl Network {
             .collect()
     }
     fn inverse(&self, bands: Vec<Tensor<4>>) -> Tensor<4> {
-        let w: Vec<f32> = (0..256)
-            .flat_map(|_| {
-                [
-                    0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5,
-                    -0.5, 0.5,
-                ]
-            })
-            .collect();
+        let weight = self
+            .ops
+            .constant_as("haar/inverse".into(), self.ops.dtype, || {
+                (0..256)
+                    .flat_map(|_| {
+                        [
+                            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5,
+                            -0.5, -0.5, 0.5,
+                        ]
+                    })
+                    .collect()
+            });
         let x = Tensor::stack::<5>(bands, 2).reshape([1, 1024, 256, 256]);
         module::conv_transpose2d(
             x,
-            upload(w, [1024, 1, 2, 2], &self.ops.device, self.ops.dtype),
+            weight.reshape([1024, 1, 2, 2]),
             None,
             ConvTransposeOptions::new([2; 2], [0; 2], [0; 2], [1; 2], 256),
         )
     }
     fn smooth(&self, x: Tensor<4>) -> Tensor<4> {
-        let mut g = Vec::new();
-        for y in -10..=10 {
-            for xx in -10..=10 {
-                g.push((-0.5 * ((y * y + xx * xx) as f32)).exp());
-            }
-        }
-        let sum: f32 = g.iter().sum();
-        for v in &mut g {
-            *v /= sum;
-        }
-        let weight = upload(
-            g.repeat(256),
-            [256, 1, 21, 21],
-            &self.ops.device,
-            self.ops.dtype,
-        );
+        let weight = self
+            .ops
+            .constant_as("gaussian/21".into(), self.ops.dtype, || {
+                let mut g = Vec::new();
+                for y in -10..=10 {
+                    for x in -10..=10 {
+                        g.push((-0.5 * ((y * y + x * x) as f32)).exp());
+                    }
+                }
+                let sum: f32 = g.iter().sum();
+                for v in &mut g {
+                    *v /= sum;
+                }
+                g.repeat(256)
+            })
+            .reshape([256, 1, 21, 21]);
         module::conv2d(
             x,
             weight,
@@ -439,18 +371,14 @@ impl Network {
         )
     }
     pub fn encode(&self, images: &[Packed]) -> Vec<Packed> {
+        let _timer = self.ops.span("encoder");
         let preparation = crate::progress::phase("canonical/resize inputs", 1, "stage");
         let small: Vec<_> = images
             .iter()
             .map(|im| {
                 Packed::capture(
                     self.ops.resize(
-                        upload(
-                            im.range(0..im.len()),
-                            [1, 3, 512, 512],
-                            &self.ops.device,
-                            self.ops.dtype,
-                        ),
+                        im.upload_range(0..im.len(), [1, 3, 512, 512], &self.ops.device),
                         256,
                         true,
                     ),
@@ -466,7 +394,7 @@ impl Network {
         for f in 0..images.len() {
             let x = self.fusion(&stages, f);
             let x = self.ops.resize(x, 512, true);
-            result.push(Packed::capture(x, self.ops.dtype));
+            result.push(self.ops.capture(x));
             fusion_progress.set(f + 1);
         }
         drop(fusion_progress);
@@ -481,15 +409,11 @@ impl Network {
         for f in 0..images.len() {
             let bands = (0..4).map(|k| self.fusion(&stages, f * 4 + k)).collect();
             let x = self.inverse(bands);
-            let canonical = upload(
-                result[f].range(0..result[f].len()),
-                [1, 256, 512, 512],
-                &self.ops.device,
-                self.ops.dtype,
-            );
+            let canonical =
+                result[f].upload_range(0..result[f].len(), [1, 256, 512, 512], &self.ops.device);
             let x = self.smooth(x + canonical);
             // Pixel-major host layout makes sample gathering contiguous across channels.
-            result[f] = Packed::capture(x.permute([0, 2, 3, 1]), self.ops.dtype);
+            result[f] = self.ops.capture(x.permute([0, 2, 3, 1]));
             fusion_progress.set(f + 1);
         }
         result
@@ -526,6 +450,7 @@ impl Network {
         o + self.ops.linear(z, &format!("{p}.fc_o2"))
     }
     pub fn decode(&self, rgb: Tensor<3>, features: Tensor<3>) -> Vec<(String, Tensor<3>)> {
+        let _timer = self.ops.span("decoder");
         let [pixels, _, _] = rgb.dims();
         let rgb = self.ops.linear(
             activation::leaky_relu(self.ops.linear(rgb, "img_embedding.0"), 0.01),
@@ -582,5 +507,13 @@ impl Network {
             out.push((name.into(), y));
         }
         out
+    }
+}
+
+fn x_bytes_for_fusion(layer: usize) -> usize {
+    match layer {
+        0 => 256 * 256 * 256 * 4,
+        1 => 256 * 128 * 128 * 4,
+        _ => 256 * 64 * 64 * 4,
     }
 }

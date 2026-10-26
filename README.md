@@ -112,8 +112,9 @@ View 1/20 view_00 block 1/4 | wavelet/global 2/4 / attention | [====----] 50% 73
 Percentages and estimated remaining times refer to the current stage, not the
 whole view. An ETA appears after two completed work units and can fluctuate,
 particularly during first-use compilation/tuning. Elapsed time keeps updating
-during long calls even if the completion counter has not moved. No GPU waits or
-tensor readbacks are added for progress. Verbose messages clear the live line;
+during long calls even if the completion counter has not moved. Counters follow submitted stages and existing readback boundaries; opaque fused
+kernels show a launch stage with elapsed time rather than invented tile progress.
+No GPU waits or tensor readbacks are added for progress. Verbose messages clear the live line;
 redirected output uses plain snapshots every 15 seconds plus view completion.
 Use --no-progress to disable the bar/heartbeat and periodic snapshots. Ordinary
 result messages and optional --verbose reports remain available.
@@ -123,13 +124,13 @@ result messages and optional --verbose reports remain available.
 * All global attention retains all lights and all wavelet streams. Online softmax
   tiles both queries and keys with FP32 statistics instead of full score matrices.
   --score-budget-mib defaults to 64 and governs score temporaries, not total VRAM.
-* Per-image DINO/frame blocks use --encoder-batch (default 1). Cross-light blocks
+* Per-image DINO/frame blocks use --encoder-batch (default 2). Cross-light blocks
   are only batched across independent spatial positions, never split by lights.
 * Four concatenated transformer-stage outputs are copied to compact CPU backing
   one stream at a time. No full four-stage GPU stack or unused light-token outputs.
 * Fusion runs one stream at a time, releases intermediates by ownership and performs
-  FP32 interpolation in 16-channel slices. It never creates the huge whole-batch
-  FP32 upsample plus a second whole-batch BF16 result.
+  FP32 interpolation in a fused streaming kernel with no full FP32 temporary.
+  The reference fallback uses 16-channel slices.
 * Only one light's dense fusion/smoothing pipeline is live on the GPU. The final
   maps live in CPU half precision (FP32 when requested), in pixel-major layout.
   Gaussian smoothing has no retained chunk list or concatenated duplicate.
@@ -142,8 +143,9 @@ CPU RAM still grows with light count: final dense features alone cost 128 MiB pe
 light in half precision, plus transformer-stage backing and input images. GPU
 weights and live global tokens also grow or remain resident; this is not a promise
 of constant memory or that every light count fits every GPU. Explicit transfers
-and bounded scheduling trade speed for memory. The online GEMM attention is a
-portable baseline, not a claimed speed match for PyTorch FlashAttention.
+and bounded scheduling trade speed for memory. Attention now tries accelerated CubeK FlashAttention, then unit flash and
+portable streaming kernels; it never falls back to a full dense score matrix.
+Actual speed and memory must be measured on the target GPU.
 
 --pixel-batch defaults to 2048 and preserves upstream sample-group semantics.
 Changing it changes the regressor's spatial context and can change output quality.
@@ -151,3 +153,60 @@ For memory tuning prefer encoder-batch and score-budget-mib first. No patch-size
 checkpoint or attention-receptive-field reduction is used as a memory shortcut.
 
 See NOTICE and the included licenses for upstream attribution.
+
+## Optimization pass (requires your rebuild and validation)
+
+* Position embeddings use compact separable lookup tables generated once per
+  shape/precision. GPU kernels apply them directly: no repeated billion-element
+  CPU trig loops or whole spatial-embedding uploads. Rotary positions use small
+  reusable coordinate/frequency tables and a fused kernel as well.
+* Bilinear interpolation reads four input samples, computes in FP32 and writes
+  the requested dtype in one portable CubeCL kernel, preserving align_corners.
+* Long attention tries accelerated flash configurations and then unit flash.
+  Short light attention uses a fused subgroup online-softmax kernel. A scalar
+  streaming fallback covers GPUs without subgroup support. Every fallback visits
+  all keys with FP32 softmax statistics; none materializes full scores.
+* Only queries are padded for accelerated-kernel alignment; keys/values are not
+  padded, so normalization does not include dummy keys. CubeK 0.3's flash path
+  ignores the supplied scale option; query scaling explicitly preserves LINO's
+  differing normal/efficient attention scales. Floating-point rounding can still
+  differ from the baseline and needs output validation.
+* Decoder pre-gathers the next sample batch on the CPU while submitted GPU work
+  finishes. Only compact host sample buffers are double-buffered; no additional
+  full-resolution feature maps become resident on the GPU.
+* Half features transfer as half data directly. Decoder gathers copy contiguous
+  pixel-major rows without scalar half-to-float-to-half conversion. Stage backing
+  is built directly in the target dtype instead of a full FP32 staging vector.
+* Linear weights are packed into native GEMM layout once, without a duplicate
+  resident copy. Normalization parameters and Haar/Gaussian filter buffers are
+  also prepared/reused instead of recreated for each call.
+* LayerNorm uses a subgroup kernel with FP32 register statistics and FP32 affine
+  parameters, preserving each layer's epsilon. Unsupported devices/register
+  sizes retain the tensor fallback. This removes the full FP32 input cast and
+  separate normalization/cast passes for supported shapes.
+* Small submissions queue asynchronously. --inflight-mib defaults to 64 and
+  bounds an estimate of queued temporaries, with a secondary 32-operation guard.
+  This is not a hard total-VRAM cap; model weights, live tokens, dense per-light
+  outputs and backend workspaces are additional. Readbacks remain completion
+  boundaries. Unused allocator reservation above 256 MiB is reclaimed between
+  blocks, never inside hot attention loops. Geometry constants are capped at
+  16 MiB per model; no new cross-run persistence is introduced.
+* Independent-image batching defaults to 2; --encoder-batch 1 restores the
+  smallest encoder working set. Pixel sampling remains 2048 by default and all
+  global attention continues to see every light and wavelet stream.
+
+Use --reference-kernels to bypass native attention/geometry/LayerNorm for diagnosis. It
+retains bounded tiled attention, compact host transfers and the new scheduling;
+it is not an exact replay of the old binary. --score-budget-mib bounds tiled
+GEMM score temporaries in that fallback; fused flash/streaming have no full-score
+allocation. Reducing --inflight-mib is the first queue-memory adjustment.
+
+metadata.json now includes per-view operation counts/inclusive wall times and
+process-total dispatch counts for accelerated flash, unit flash, subgroup and
+scalar attention. With --verbose, profile.json contains blocks and operations.
+Timings measure CPU wall time including waits encountered in that scope, not
+GPU timestamps. Parent/child entries overlap and must not be summed.
+
+No compilation, inference or benchmark was run by the coding agent. This pass
+has source parsing/format and dependency-resolution checks only. Keep the known
+working executable for comparison and use a fresh output directory for each run.

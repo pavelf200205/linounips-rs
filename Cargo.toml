@@ -11,6 +11,10 @@ cuda = ["burn/cuda"]
 [dependencies]
 anyhow = "1"
 burn = { version = "=0.22.0", default-features = false, features = ["std", "wgpu", "vulkan", "flex", "fusion", "autotune", "extension"] }
+burn-backend = { version = "=0.22.0", default-features = false }
+burn-cubecl = { version = "=0.22.0", default-features = false, features = ["std", "fusion"] }
+burn-fusion = { version = "=0.22.0", default-features = false, features = ["std"] }
+cubek = { version = "=0.3.0", default-features = false, features = ["attention"] }
 cubecl = { version = "=0.11.0", default-features = false, features = ["std", "vulkan"] }
 cubecl-environment = { version = "=0.11.0", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
