@@ -1,0 +1,14 @@
+LINO-UniPS Rust inference implementation
+
+Architecture and preprocessing adapted from:
+https://github.com/houyuanchen111/LINO_UniPS
+Revision 4ddb4113d0196b853978d2cc72de582611b01ebd
+Copyright (c) 2025 houyuanchen111, MIT license (LICENSE-MIT).
+
+The upstream DINO / alternating transformer and rotary position implementation
+contains code attributed to Meta Platforms, Inc. and affiliates under Apache-2.0.
+The corresponding algorithm is reimplemented in Rust in src/network.rs.
+See LICENSE-APACHE. No checkpoint weights are distributed in this repository.
+
+The CLI conventions and release-helper structure follow the local unimsps-rs
+project. The neural graph is independent and does not link to unimsps-rs.

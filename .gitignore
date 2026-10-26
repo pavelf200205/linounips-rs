@@ -1,0 +1,6 @@
+/target/
+/experiments/
+/weights/
+*.pth
+*.safetensors
+__pycache__/
