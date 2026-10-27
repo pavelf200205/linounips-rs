@@ -1,5 +1,13 @@
 # Experimental inference routes
 
+**Current defaults supersede the opt-in descriptions below:** the user tested
+GEMM convolution, fused resize/convolution and FlashAttention at 38.33 seconds
+with no noticeable quality change and requested them as defaults. They now run
+without flags; the positive switches remain accepted for compatibility. Use
+`--burn-convolutions`, `--no-fused-resize-conv`, and `--no-flash-attention` to
+disable them separately. See [NEXT_PERFORMANCE.md](NEXT_PERFORMANCE.md) for the
+new default dispatch, optional Winograd and the updated benchmark cases.
+
 The cb276ee run2 metadata records 94.70 seconds inference: 24.49 seconds canonical
 fusion/readback and 41.07 seconds wavelet fusion/smoothing/readback. CPU gathering
 is 0.16 seconds. The new experiments target dense GPU work and dispatch overhead.

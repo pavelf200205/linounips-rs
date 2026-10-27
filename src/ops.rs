@@ -21,6 +21,14 @@ pub struct Ops {
     pub attention_query_chunk: usize,
     pub mlp_chunk_tokens: usize,
     pub pool_cache_mib: usize,
+    pub direct_convolutions: bool,
+    pub fused_conv_activation: bool,
+    pub conv_layer_window: usize,
+    pub winograd_convolutions: bool,
+    winograd_weights: RefCell<HashMap<String, Tensor<3>>>,
+    winograd_weight_bytes: Cell<usize>,
+    direct_pending_layers: Cell<usize>,
+    direct_pending_bytes: Cell<usize>,
     routes: RefCell<BTreeMap<&'static str, u64>>,
     pub device: Device,
     pub dtype: FloatDType,
@@ -223,9 +231,17 @@ impl Ops {
         }
 
         Ok(Self {
-            gemm_convolutions: false,
-            fused_resize_conv: false,
-            flash_attention: false,
+            gemm_convolutions: true,
+            fused_resize_conv: true,
+            flash_attention: true,
+            direct_convolutions: true,
+            fused_conv_activation: true,
+            conv_layer_window: 2,
+            winograd_convolutions: false,
+            winograd_weights: RefCell::new(HashMap::new()),
+            winograd_weight_bytes: Cell::new(0),
+            direct_pending_layers: Cell::new(0),
+            direct_pending_bytes: Cell::new(0),
             wide_wavelet_fusion: false,
             conv_workspace_mib: 16,
             conv_queue_depth: 2,
@@ -356,7 +372,7 @@ impl Ops {
             .then(|| self.span(&format!("conv/{p}/{:?}/s{stride}", x.dims())));
         if self.gemm_convolutions && !self.reference_kernels && crate::conv_gemm::supported(&x) {
             let [_, _, h, w] = x.dims();
-            return self.conv_gemm(x, p, stride, pad, h, w, false);
+            return self.conv_gemm(x, p, stride, pad, h, w, false, false);
         }
         let bias_key = format!("{p}.bias");
         let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
@@ -368,6 +384,37 @@ impl Ops {
         )
     }
 
+    pub fn conv_leaky(&self, x: Tensor<4>, p: &str, stride: usize, pad: usize) -> Tensor<4> {
+        if self.gemm_convolutions
+            && self.direct_convolutions
+            && self.fused_conv_activation
+            && !self.reference_kernels
+            && crate::conv_gemm::supported(&x)
+        {
+            let [_, _, h, w] = x.dims();
+            return self.conv_gemm(x, p, stride, pad, h, w, false, true);
+        }
+        self.leaky(self.conv(x, p, stride, pad))
+    }
+
+    fn submit_direct_workspace(&self, bytes: usize) {
+        let layers = self.direct_pending_layers.get() + 1;
+        let pending = self.direct_pending_bytes.get().saturating_add(bytes);
+        if (self.conv_layer_window > 0 && layers >= self.conv_layer_window)
+            || pending >= self.inflight_mib * 1024 * 1024
+        {
+            let _timer = self.span("conv/direct_window_wait");
+            self.device
+                .sync()
+                .expect("bounded direct convolution window");
+            self.direct_pending_layers.set(0);
+            self.direct_pending_bytes.set(0);
+        } else {
+            self.direct_pending_layers.set(layers);
+            self.direct_pending_bytes.set(pending);
+        }
+    }
+
     fn conv_gemm(
         &self,
         x: Tensor<4>,
@@ -377,6 +424,7 @@ impl Ops {
         h: usize,
         w: usize,
         upsample: bool,
+        leaky: bool,
     ) -> Tensor<4> {
         let _timer = self.span("experimental/conv_gemm");
         *self
@@ -392,6 +440,41 @@ impl Ops {
         let weight: Tensor<4> = self.w(&format!("{p}.weight"));
         let [o, _, kh, kw] = weight.dims();
         assert_eq!(kh, kw);
+        if self.winograd_convolutions && !upsample && kh == 3 && stride == 1 && pad == 1 {
+            let _timer = self.span("conv/winograd");
+            let cached = self.winograd_weights.borrow().get(p).cloned();
+            let transformed = cached.or_else(|| crate::winograd::weights(weight.clone()));
+            if let Some(transformed) = transformed {
+                let bytes = if self.dtype == FloatDType::F32 { 4 } else { 2 };
+                let weight_bytes = 16 * o * c * bytes;
+                if !self.winograd_weights.borrow().contains_key(p)
+                    && self.winograd_weight_bytes.get() + weight_bytes <= 64 * 1024 * 1024
+                {
+                    self.winograd_weights
+                        .borrow_mut()
+                        .insert(p.to_owned(), transformed.clone());
+                    self.winograd_weight_bytes
+                        .set(self.winograd_weight_bytes.get() + weight_bytes);
+                }
+                let limit = (self.conv_workspace_mib * 1024 * 1024 / (16 * c * bytes))
+                    .max(1)
+                    .min((b * h.div_ceil(2) * w.div_ceil(2)).next_power_of_two());
+                let rows = 1usize << limit.ilog2();
+                let bias_key = format!("{p}.bias");
+                let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
+                if let Some(out) =
+                    crate::winograd::forward(x.clone(), transformed, bias, rows, leaky)
+                {
+                    *self
+                        .routes
+                        .borrow_mut()
+                        .entry("winograd_layers")
+                        .or_default() += 1;
+                    self.submit_direct_workspace(rows * 16 * (c + o) * bytes);
+                    return out;
+                }
+            }
+        }
         let reduction = c * kh * kw;
         let oh = (h + 2 * pad - kh) / stride + 1;
         let ow = (w + 2 * pad - kw) / stride + 1;
@@ -401,6 +484,30 @@ impl Ops {
             .max(1)
             .min(hw.next_power_of_two());
         let rows = 1usize << limit.ilog2();
+        if self.direct_convolutions {
+            let bias_key = format!("{p}.bias");
+            let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
+            if let Some(out) = crate::conv_gemm::direct(
+                x.clone(),
+                weight.clone(),
+                bias,
+                h,
+                w,
+                stride,
+                pad,
+                rows,
+                upsample,
+                leaky,
+            ) {
+                *self
+                    .routes
+                    .borrow_mut()
+                    .entry("direct_conv_layers")
+                    .or_default() += 1;
+                self.submit_direct_workspace(rows * (reduction + o) * bytes);
+                return out;
+            }
+        }
         let weight = weight.reshape([1, o, reduction]);
         let bias_key = format!("{p}.bias");
         let bias = self
@@ -457,7 +564,8 @@ impl Ops {
         } else {
             self.boundary();
         }
-        output.reshape([b, o, oh, ow])
+        let out = output.reshape([b, o, oh, ow]);
+        if leaky { self.leaky(out) } else { out }
     }
 
     pub fn conv_upsampled(
@@ -469,7 +577,7 @@ impl Ops {
         pad: usize,
     ) -> Tensor<4> {
         if self.fused_resize_conv && !self.reference_kernels && crate::conv_gemm::supported(&x) {
-            return self.conv_gemm(x, p, stride, pad, size, size, true);
+            return self.conv_gemm(x, p, stride, pad, size, size, true, false);
         }
         self.conv(self.resize(x, size, true), p, stride, pad)
     }
@@ -1006,6 +1114,8 @@ impl Ops {
         self.readback_calls.set(self.readback_calls.get() + 1);
         self.sample_pool();
         let data = crate::host::Packed::capture(x, self.dtype);
+        self.direct_pending_layers.set(0);
+        self.direct_pending_bytes.set(0);
         self.pending_bytes.set(0);
         self.pending_ops.set(0);
         data
@@ -1047,7 +1157,7 @@ impl Ops {
     }
 
     pub fn experiment_report(&self) -> serde_json::Value {
-        serde_json::json!({"gemm_convolutions":self.gemm_convolutions,"fused_resize_conv":self.fused_resize_conv,"flash_attention":self.flash_attention,"wide_wavelet_fusion":self.wide_wavelet_fusion,"conv_workspace_mib":self.conv_workspace_mib,"conv_queue_depth":self.conv_queue_depth,"attention_query_chunk":self.attention_query_chunk,"mlp_chunk_tokens":self.mlp_chunk_tokens,"pool_cache_mib":self.pool_cache_mib,"routes":*self.routes.borrow()})
+        serde_json::json!({"gemm_convolutions":self.gemm_convolutions,"fused_resize_conv":self.fused_resize_conv,"flash_attention":self.flash_attention,"wide_wavelet_fusion":self.wide_wavelet_fusion,"conv_workspace_mib":self.conv_workspace_mib,"conv_queue_depth":self.conv_queue_depth,"attention_query_chunk":self.attention_query_chunk,"mlp_chunk_tokens":self.mlp_chunk_tokens,"pool_cache_mib":self.pool_cache_mib,"direct_convolutions":self.direct_convolutions,"fused_conv_activation":self.fused_conv_activation,"conv_layer_window":self.conv_layer_window,"winograd_convolutions":self.winograd_convolutions,"winograd_cached_weight_bytes":self.winograd_weight_bytes.get(),"routes":*self.routes.borrow()})
     }
 
     pub fn timing_summary(&self) -> String {

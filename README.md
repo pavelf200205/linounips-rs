@@ -5,12 +5,13 @@ based on upstream revision 4ddb4113d0196b853978d2cc72de582611b01ebd.
 
 ## Current memory/performance pass
 
-Experimental follow-up: use `--experimental-fast` to try bounded GEMM
-convolutions, fused resize/convolution packing and direct FlashAttention.
-These routes are opt-in because changing reductions can change floating-point
-rounding. No lower-resolution inputs, missing lights or shorter attention context
-are used. See [EXPERIMENTS.md](EXPERIMENTS.md) for isolated switches and the manual
-benchmark matrix. This revision has not been built or run on a GPU by the agent.
+GEMM convolution, fused resize/convolution and FlashAttention are now enabled by
+default, following the user's 38.33-second run and quality assessment. The next
+pass adds reusable GPU convolution workspaces and fused convolution stores.
+`--legacy-fast-path` restores the measured 38-second dispatch path.
+`--winograd-convolutions` is an additional opt-in experiment. See
+[NEXT_PERFORMANCE.md](NEXT_PERFORMANCE.md) for the changes, memory limits and
+comparison commands. This revision has not been built or run on a GPU by the agent.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for the current implementation, exact-output
 comparison procedure and timing interpretation. This pass retains arithmetic,

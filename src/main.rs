@@ -10,6 +10,7 @@ mod ops;
 mod output;
 mod progress;
 mod schema;
+mod winograd;
 use anyhow::{Context, Result, ensure};
 use burn::tensor::{Device, DeviceKind, FloatDType, Tensor};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -69,9 +70,33 @@ struct Cli {
     fused_resize_conv: bool,
     #[arg(long, global = true)]
     flash_attention: bool,
+    /// Restore the original Burn convolution route.
+    #[arg(long, global = true)]
+    burn_convolutions: bool,
+    #[arg(long, global = true)]
+    no_fused_resize_conv: bool,
     /// Exclude flash from the experimental preset.
-    #[arg(long, global = true, conflicts_with = "flash_attention")]
+    #[arg(
+        long = "no-flash-attention",
+        alias = "no-experimental-flash",
+        global = true,
+        conflicts_with = "flash_attention"
+    )]
     no_experimental_flash: bool,
+    /// Restore the measured 38-second preset's dispatch and separate activation paths.
+    #[arg(long, global = true)]
+    legacy_fast_path: bool,
+    /// Restore high-level pack/GEMM/scatter and per-chunk completion waits.
+    #[arg(long, global = true)]
+    legacy_conv_dispatch: bool,
+    #[arg(long, global = true)]
+    separate_conv_activation: bool,
+    /// Maximum direct-convolution layers queued at once; workspace budget also applies.
+    #[arg(long, global = true, default_value_t = 2)]
+    conv_layer_window: usize,
+    /// Try F(2x2,3x3) Winograd on stride-1 convolutions; changes transform-domain rounding.
+    #[arg(long, global = true)]
+    winograd_convolutions: bool,
     /// Fuse all four wavelet streams together (higher live activation memory).
     #[arg(long, global = true)]
     wide_wavelet_fusion: bool,
@@ -181,6 +206,10 @@ fn main() -> Result<()> {
             && cli.pool_cache_mib <= 65536
             && cli.conv_queue_depth <= 64,
         "Experimental settings out of range (workspace 1..1024 MiB; query chunk 64..16384; MLP <=65536; queue <=64)"
+    );
+    ensure!(
+        cli.conv_layer_window <= 64,
+        "Convolution layer window must be <=64"
     );
     use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
     let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
@@ -298,10 +327,13 @@ fn main() -> Result<()> {
     ops.inflight_mib = cli.inflight_mib;
     ops.memory_optimizations = !cli.legacy_memory_path;
     ops.profile_sync = cli.profile_sync;
-    ops.gemm_convolutions = cli.experimental_fast || cli.gemm_convolutions;
-    ops.fused_resize_conv = cli.experimental_fast || cli.fused_resize_conv;
-    ops.flash_attention =
-        (cli.experimental_fast || cli.flash_attention) && !cli.no_experimental_flash;
+    ops.gemm_convolutions = !cli.burn_convolutions;
+    ops.fused_resize_conv = !cli.no_fused_resize_conv;
+    ops.flash_attention = !cli.no_experimental_flash;
+    ops.direct_convolutions = !cli.legacy_fast_path && !cli.legacy_conv_dispatch;
+    ops.fused_conv_activation = !cli.legacy_fast_path && !cli.separate_conv_activation;
+    ops.conv_layer_window = cli.conv_layer_window;
+    ops.winograd_convolutions = cli.winograd_convolutions && !cli.legacy_fast_path;
     ops.wide_wavelet_fusion = cli.wide_wavelet_fusion;
     ops.conv_workspace_mib = cli.conv_workspace_mib;
     ops.conv_queue_depth = cli.conv_queue_depth;
@@ -439,13 +471,20 @@ fn main() -> Result<()> {
                         dtype,
                     )
                 });
-                let predictions = net.decode(
-                    colors.into_tensor([count, n, 3], &net.ops.device),
-                    f.into_tensor([count, n, 256], &net.ops.device),
-                );
+                let (colors, f) = {
+                    let _timer = net.ops.span("decoder/input_upload");
+                    (
+                        colors.into_tensor([count, n, 3], &net.ops.device),
+                        f.into_tensor([count, n, 256], &net.ops.device),
+                    )
+                };
+                let predictions = net.decode(colors, f);
                 // Submit the current GPU work, then gather the next CPU batch while
                 // it runs. Only host buffers are double-buffered, not dense GPU maps.
-                net.ops.boundary();
+                {
+                    let _timer = net.ops.span("decoder/submit");
+                    net.ops.boundary();
+                }
                 if group + 1 < groups {
                     let next_count = base + usize::from(group + 1 < extra);
                     if next_count > 0 {
@@ -542,6 +581,8 @@ fn main() -> Result<()> {
         metadata["memory"] = net.ops.memory_report();
         metadata["experiments"] = net.ops.experiment_report();
         metadata["experimental_flash_dispatch_totals"] = flash_attention::stats();
+        metadata["direct_convolution_dispatch_totals"] = conv_gemm::direct_stats();
+        metadata["winograd_dispatch_totals"] = winograd::stats();
         metadata["blocks"] = serde_json::json!(profile);
         metadata["timing_kind"] = serde_json::json!(if cli.profile_sync {
             "synchronized inclusive CPU wall time; diagnostic mode changes execution; nested spans overlap"

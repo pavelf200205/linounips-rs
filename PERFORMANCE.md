@@ -1,8 +1,10 @@
 # Memory and exact-output performance pass
 
-The later opt-in experiments are documented in [EXPERIMENTS.md](EXPERIMENTS.md).
-The exact-output contract below describes the default memory path; alternative
-GEMM/flash routes require separate equality validation.
+This describes the historical memory-only pass. The subsequently user-validated
+GEMM/flash paths are now defaults; current behavior and the next experiments are
+documented in [NEXT_PERFORMANCE.md](NEXT_PERFORMANCE.md). The exact-output contract
+below applies to that earlier memory-only pass, not a bitwise guarantee for GEMM,
+FlashAttention or Winograd.
 
 ## Contract
 

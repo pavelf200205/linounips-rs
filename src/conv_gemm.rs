@@ -14,7 +14,252 @@ use burn_fusion::{
     },
 };
 use cubecl::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 type Gpu = Fusion<CubeBackend>;
+
+static DIRECT_LAYERS: AtomicU64 = AtomicU64::new(0);
+static DIRECT_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+#[cube(launch)]
+fn store_chunk<F: Float>(
+    product: &Tensor<F>,
+    bias: &Tensor<F>,
+    out: &mut Tensor<F>,
+    start: usize,
+    count: usize,
+    batch: usize,
+    #[comptime] has_bias: bool,
+    #[comptime] leaky: bool,
+) {
+    let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
+    let channels = product.shape(1);
+    if i < channels * count {
+        let ch = i / count;
+        let pixel = i % count;
+        let mut value = product[ch * product.stride(1) + pixel];
+        if has_bias {
+            value += bias[ch];
+        }
+        if leaky {
+            if value < F::new(0.0_f32) {
+                value *= F::new(0.01_f32);
+            }
+        }
+        let hw = out.shape(2) * out.shape(3);
+        out[(batch * channels + ch) * hw + start + pixel] = value;
+    }
+}
+
+#[derive(Debug)]
+struct DirectOp {
+    desc: CustomOpIr,
+    height: usize,
+    width: usize,
+    stride: usize,
+    pad: usize,
+    rows: usize,
+    upsample: bool,
+    has_bias: bool,
+    leaky: bool,
+}
+
+impl Operation<FusionCubeRuntime> for DirectOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        use burn_cubecl::{
+            kernel::matmul::{MatmulStrategy, matmul},
+            ops::reshape,
+        };
+        let x = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[0]);
+        let w = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+        let bias = if self.has_bias {
+            handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[2])
+        } else {
+            w.clone()
+        };
+        let [b, c, _, _] = x.meta.shape().dims::<4>();
+        let [o, _, kh, kw] = w.meta.shape().dims::<4>();
+        let oh = (self.height + 2 * self.pad - kh) / self.stride + 1;
+        let ow = (self.width + 2 * self.pad - kw) / self.stride + 1;
+        let hw = oh * ow;
+        let client = x.client.clone();
+        let hardware = &client.properties().hardware;
+        let output = empty_device_contiguous_dtype(
+            client.clone(),
+            x.device.clone(),
+            Shape::new([b, o, oh, ow]),
+            x.dtype,
+        );
+        // These two buffers are intentionally reused in command order. GPU writes
+        // to the next chunk follow all reads/stores of the preceding chunk.
+        // No host wait and no per-chunk allocation is necessary.
+        let packed = empty_device_contiguous_dtype(
+            client.clone(),
+            x.device.clone(),
+            Shape::new([1, c * kh * kw, self.rows]),
+            x.dtype,
+        );
+        let product = empty_device_contiguous_dtype(
+            client.clone(),
+            x.device.clone(),
+            Shape::new([1, o, self.rows]),
+            x.dtype,
+        );
+        let w = reshape(w, Shape::new([1, o, c * kh * kw]));
+        let grid = |elements: usize| -> Result<CubeCount, ExecutionError> {
+            let groups = elements.div_ceil(256);
+            let gy = groups.div_ceil(hardware.max_cube_count.0 as usize).max(1);
+            let gx = groups.div_ceil(gy).max(1);
+            if gy > hardware.max_cube_count.1 as usize {
+                return Err(ExecutionError::generic(
+                    "Direct convolution exceeds grid limits",
+                ));
+            }
+            Ok(CubeCount::Static(gx as u32, gy as u32, 1))
+        };
+        let pack_grid = grid(c * kh * kw * self.rows)?;
+        let dim = CubeDim::new_1d(256);
+        for bi in 0..b {
+            for start in (0..hw).step_by(self.rows) {
+                let count = self.rows.min(hw - start);
+                macro_rules! pack_launch {
+                    ($ty:ty) => {
+                        pack::launch::<$ty>(
+                            &client,
+                            pack_grid.clone(),
+                            dim,
+                            x.clone().into_tensor_arg(),
+                            packed.clone().into_tensor_arg(),
+                            bi * hw + start,
+                            self.height,
+                            self.width,
+                            kh,
+                            self.stride,
+                            self.pad,
+                            oh,
+                            ow,
+                            self.upsample,
+                        )
+                    };
+                }
+                match x.dtype {
+                    DType::F16 => pack_launch!(half::f16),
+                    DType::BF16 => pack_launch!(half::bf16),
+                    DType::F32 => pack_launch!(f32),
+                    _ => {
+                        return Err(ExecutionError::generic(
+                            "Unsupported direct convolution dtype",
+                        ));
+                    }
+                };
+                matmul(
+                    w.clone(),
+                    packed.clone(),
+                    Some(product.clone()),
+                    MatmulStrategy::default(),
+                    x.dtype,
+                )
+                .map_err(|e| ExecutionError::generic(format!("Direct convolution GEMM: {e:?}")))?;
+                let store_grid = grid(o * count)?;
+                macro_rules! store_launch {
+                    ($ty:ty) => {
+                        store_chunk::launch::<$ty>(
+                            &client,
+                            store_grid,
+                            dim,
+                            product.clone().into_tensor_arg(),
+                            bias.clone().into_tensor_arg(),
+                            output.clone().into_tensor_arg(),
+                            start,
+                            count,
+                            bi,
+                            self.has_bias,
+                            self.leaky,
+                        )
+                    };
+                }
+                match x.dtype {
+                    DType::F16 => store_launch!(half::f16),
+                    DType::BF16 => store_launch!(half::bf16),
+                    DType::F32 => store_launch!(f32),
+                    _ => unreachable!(),
+                };
+                DIRECT_CHUNKS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        DIRECT_LAYERS.fetch_add(1, Ordering::Relaxed);
+        handles.register_float_tensor::<CubeBackend>(&self.desc.outputs[0].id, output);
+        Ok(())
+    }
+}
+
+pub fn direct(
+    x: BurnTensor<4>,
+    weight: BurnTensor<4>,
+    bias: Option<BurnTensor<1>>,
+    height: usize,
+    width: usize,
+    stride: usize,
+    pad: usize,
+    rows: usize,
+    upsample: bool,
+    leaky: bool,
+) -> Option<BurnTensor<4>> {
+    let [b, _, _, _] = x.dims();
+    let [o, _, kh, _] = weight.dims();
+    let oh = (height + 2 * pad - kh) / stride + 1;
+    let ow = (width + 2 * pad - kh) / stride + 1;
+    let x = x.inner().try_into_primitive::<Gpu>().ok()?;
+    let weight = weight.inner().try_into_primitive::<Gpu>().ok()?;
+    let client = x.client.clone();
+    let has_bias = bias.is_some();
+    let mut inputs = vec![x.into_ir(), weight.into_ir()];
+    if let Some(bias) = bias {
+        inputs.push(bias.inner().try_into_primitive::<Gpu>().ok()?.into_ir());
+    }
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        Shape::new([b, o, oh, ow]),
+        inputs[0].dtype,
+    );
+    let scalars = [
+        height,
+        width,
+        stride,
+        pad,
+        rows,
+        upsample as usize,
+        has_bias as usize,
+        leaky as usize,
+    ]
+    .map(|n| ScalarIr::UInt(n as u64))
+    .to_vec();
+    let desc = CustomOpIr::with_scalars("lino_direct_conv_v1", &inputs, &[out], scalars);
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            DirectOp {
+                desc,
+                height,
+                width,
+                stride,
+                pad,
+                rows,
+                upsample,
+                has_bias,
+                leaky,
+            },
+        )
+        .outputs();
+    Some(BurnTensor::from_primitive::<Gpu>(out))
+}
+
+pub fn direct_stats() -> serde_json::Value {
+    serde_json::json!({"layers":DIRECT_LAYERS.load(Ordering::Relaxed),"chunks":DIRECT_CHUNKS.load(Ordering::Relaxed),"workspace_allocations":DIRECT_LAYERS.load(Ordering::Relaxed) * 2})
+}
 
 #[cube(launch)]
 fn pack<F: Float>(

@@ -329,10 +329,8 @@ impl Network {
     fn residual(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
         let y = self
             .ops
-            .conv(self.ops.leaky(x.clone()), &format!("{p}.conv1"), 1, 1);
-        let y = self
-            .ops
-            .conv(self.ops.leaky(y), &format!("{p}.conv2"), 1, 1);
+            .conv_leaky(self.ops.leaky(x.clone()), &format!("{p}.conv1"), 1, 1);
+        let y = self.ops.conv(y, &format!("{p}.conv2"), 1, 1);
         x + y
     }
 
@@ -401,12 +399,12 @@ impl Network {
                 self.ops
                     .leaky(self.ops.conv2x2s2(x, &format!("{F}.resize_layers.3.0")))
             };
-            features.push(self.ops.leaky(self.ops.conv(
+            features.push(self.ops.conv_leaky(
                 x,
                 &format!("{F}.scratch.layer{}_rn.0", layer + 1),
                 1,
                 1,
-            )));
+            ));
         }
         let l4 = features.pop().unwrap();
         let l3 = features.pop().unwrap();

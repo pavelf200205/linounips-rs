@@ -19,24 +19,24 @@ if ($Runs -lt 1) { throw 'Runs must be positive.' }
 $root = [IO.Path]::GetFullPath($Out)
 New-Item -ItemType Directory -Path $root | Out-Null
 $cases = @(
-    @{Name='baseline'; Flags=@()},
-    @{Name='gemm16'; Flags=@('--gemm-convolutions')},
-    @{Name='resize'; Flags=@('--fused-resize-conv')},
-    @{Name='gemm_resize'; Flags=@('--gemm-convolutions','--fused-resize-conv')},
-    @{Name='flash'; Flags=@('--flash-attention')},
-    @{Name='all'; Flags=@('--experimental-fast')}
+    @{Name='baseline'; Flags=@('--legacy-fast-path')},
+    @{Name='direct'; Flags=@()},
+    @{Name='direct_separate_activation'; Flags=@('--separate-conv-activation')},
+    @{Name='winograd'; Flags=@('--winograd-convolutions')},
+    @{Name='direct_window1'; Flags=@('--conv-layer-window','1')},
+    @{Name='direct_window4'; Flags=@('--conv-layer-window','4')}
 )
 if ($FullMatrix) {
     $cases += @(
-        @{Name='gemm32'; Flags=@('--gemm-convolutions','--conv-workspace-mib','32')},
-        @{Name='gemm8'; Flags=@('--gemm-convolutions','--conv-workspace-mib','8')},
-        @{Name='gemm_queue1'; Flags=@('--gemm-convolutions','--conv-queue-depth','1')},
-        @{Name='gemm_queue4'; Flags=@('--gemm-convolutions','--conv-queue-depth','4')},
+        @{Name='direct32'; Flags=@('--conv-workspace-mib','32')},
+        @{Name='direct8'; Flags=@('--conv-workspace-mib','8')},
+        @{Name='winograd8'; Flags=@('--winograd-convolutions','--conv-workspace-mib','8')},
+        @{Name='winograd32'; Flags=@('--winograd-convolutions','--conv-workspace-mib','32')},
         @{Name='wide_fusion'; Flags=@('--wide-wavelet-fusion')},
         @{Name='mlp8192'; Flags=@('--mlp-chunk-tokens','8192')},
         @{Name='query1024'; Flags=@('--attention-query-chunk','1024')},
         @{Name='retain_pool'; Flags=@('--pool-cache-mib','0')},
-        @{Name='gemm_resize_pool'; Flags=@('--gemm-convolutions','--fused-resize-conv','--pool-cache-mib','0')}
+        @{Name='direct_no_flash'; Flags=@('--no-flash-attention')}
     )
 }
 $results = [Collections.Generic.List[object]]::new()
