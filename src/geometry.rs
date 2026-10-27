@@ -1,5 +1,5 @@
 //! Portable element kernels: compact LUT embeddings, rotary embeddings, resize,
-//! fused inverse Haar + canonical add, and separable 1D Gaussian smoothing.
+//! fused inverse Haar + bilinear canonical add, and coalesced separable 1D Gaussian smoothing.
 use burn::tensor::Tensor as BurnTensor;
 use burn_backend::{DType, ExecutionError, Shape};
 use burn_cubecl::{
@@ -144,13 +144,13 @@ fn bilinear<F: Float>(x: &Tensor<F>, out: &mut Tensor<F>, #[comptime] align: boo
     }
 }
 
+/// Fused inverse Haar transform from paired `[2, 256, 256, 256]` wavelet outputs (`b01`, `b23`)
+/// plus on-the-fly bilinear upsampling of `canonical_256` (`[1, 256, 256, 256]` -> `512x512`).
 #[cube(launch)]
-fn haar_inverse_add<F: Float>(
-    b0: &Tensor<F>,
-    b1: &Tensor<F>,
-    b2: &Tensor<F>,
-    b3: &Tensor<F>,
-    canonical: &Tensor<F>,
+fn haar_inverse_add_pair<F: Float>(
+    b01: &Tensor<F>,
+    b23: &Tensor<F>,
+    canonical_256: &Tensor<F>,
     out: &mut Tensor<F>,
 ) {
     let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
@@ -162,11 +162,12 @@ fn haar_inverse_add<F: Float>(
         let yy = oy / 2usize;
         let dx = ox % 2usize;
         let dy = oy % 2usize;
-        let idx = (ch * 256usize + yy) * 256usize + xx;
-        let v0 = f32::cast_from(b0[idx]);
-        let v1 = f32::cast_from(b1[idx]);
-        let v2 = f32::cast_from(b2[idx]);
-        let v3 = f32::cast_from(b3[idx]);
+        let c_base = ch * 65536usize;
+        let idx = c_base + yy * 256usize + xx;
+        let v0 = f32::cast_from(b01[idx]);
+        let v1 = f32::cast_from(b01[16777216usize + idx]);
+        let v2 = f32::cast_from(b23[idx]);
+        let v3 = f32::cast_from(b23[16777216usize + idx]);
         let mut s1 = f32::new(1.0_f32);
         if dy != 0usize {
             s1 = -1.0_f32;
@@ -176,7 +177,38 @@ fn haar_inverse_add<F: Float>(
             s2 = -1.0_f32;
         }
         let inv = F::cast_from((v0 + v1 * s1 + v2 * s2 + v3 * s1 * s2) * 0.5_f32);
-        out[i] = F::cast_from(f32::cast_from(inv) + f32::cast_from(canonical[i]));
+
+        let fy = f32::cast_from(oy) * (255.0_f32 / 511.0_f32);
+        let fx = f32::cast_from(ox) * (255.0_f32 / 511.0_f32);
+        let mut y0 = usize::cast_from(f32::floor(fy));
+        if y0 >= 256usize {
+            y0 = 255usize;
+        }
+        let mut x0 = usize::cast_from(f32::floor(fx));
+        if x0 >= 256usize {
+            x0 = 255usize;
+        }
+        let mut y1 = y0 + 1usize;
+        if y1 >= 256usize {
+            y1 = 255usize;
+        }
+        let mut x1 = x0 + 1usize;
+        if x1 >= 256usize {
+            x1 = 255usize;
+        }
+        let ay = fy - f32::cast_from(y0);
+        let ax = fx - f32::cast_from(x0);
+        let r0 = c_base + y0 * 256usize;
+        let r1 = c_base + y1 * 256usize;
+        let ca = f32::cast_from(canonical_256[r0 + x0]);
+        let cb = f32::cast_from(canonical_256[r0 + x1]);
+        let cc = f32::cast_from(canonical_256[r1 + x0]);
+        let cd = f32::cast_from(canonical_256[r1 + x1]);
+        let top = ca + (cb - ca) * ax;
+        let bottom = cc + (cd - cc) * ax;
+        let can_val = F::cast_from(top + (bottom - top) * ay);
+
+        out[i] = F::cast_from(f32::cast_from(inv) + f32::cast_from(can_val));
     }
 }
 
@@ -201,13 +233,15 @@ fn gaussian_h<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F
     }
 }
 
+/// Coalesced vertical 21-tap Gaussian pass: threads in a warp index consecutive `ox` (`0..31`)
+/// at the same `(ch, oy)` so all 21 reads hit a single contiguous L1 cache line per tap.
 #[cube(launch)]
 fn gaussian_v_nhwc<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F>) {
     let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
     if i < out.len() {
-        let ch = i % 256usize;
-        let ox = (i / 256usize) % 512usize;
-        let oy = i / 131072usize;
+        let ox = i % 512usize;
+        let oy = (i / 512usize) % 512usize;
+        let ch = i / 262144usize;
         let col_base = ch * 262144usize + ox;
         let mut sum = f32::new(0.0_f32);
         #[unroll]
@@ -220,7 +254,8 @@ fn gaussian_v_nhwc<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Ten
                 }
             }
         }
-        out[i] = F::cast_from(sum);
+        let dst = (oy * 512usize + ox) * 256usize + ch;
+        out[dst] = F::cast_from(sum);
     }
 }
 
@@ -294,18 +329,14 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
                         );
                     }
                     3 => {
-                        let b1 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
-                        let b2 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[2]);
-                        let b3 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[3]);
-                        let can = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[4]);
-                        haar_inverse_add::launch::<$ty>(
+                        let b23 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        let can = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[2]);
+                        haar_inverse_add_pair::launch::<$ty>(
                             &client,
                             count,
                             dim,
                             x.into_tensor_arg(),
-                            b1.into_tensor_arg(),
-                            b2.into_tensor_arg(),
-                            b3.into_tensor_arg(),
+                            b23.into_tensor_arg(),
                             can.into_tensor_arg(),
                             result.clone().into_tensor_arg(),
                         );
@@ -371,7 +402,7 @@ fn register(
     // Shapes/align are semantic scalars: fusion must not deduplicate different resizes.
     let mut scalars = vec![ScalarIr::UInt(kind as u64), ScalarIr::UInt(align as u64)];
     scalars.extend(shape.map(|n| ScalarIr::UInt(n as u64)));
-    let desc = CustomOpIr::with_scalars("lino_geometry_v1", &inputs, &[out], scalars);
+    let desc = CustomOpIr::with_scalars("lino_geometry_v2", &inputs, &[out], scalars);
     let [out] = client
         .register(
             StreamId::current(),
@@ -402,20 +433,14 @@ pub fn resize(x: BurnTensor<4>, size: usize, align: bool) -> Option<BurnTensor<4
     register(x, vec![], vec![], 2, [b, c, size, size], align)
 }
 
-pub fn inverse_haar_add(
-    mut bands: Vec<BurnTensor<4>>,
-    canonical: BurnTensor<4>,
+pub fn inverse_haar_add_pair(
+    b01: BurnTensor<4>,
+    b23: BurnTensor<4>,
+    canonical_256: BurnTensor<4>,
 ) -> Option<BurnTensor<4>> {
-    if bands.len() != 4 {
-        return None;
-    }
-    let b3 = bands.pop()?;
-    let b2 = bands.pop()?;
-    let b1 = bands.pop()?;
-    let b0 = bands.pop()?;
     register(
-        b0,
-        vec![b1, b2, b3, canonical],
+        b01,
+        vec![b23, canonical_256],
         vec![],
         3,
         [1, 256, 512, 512],

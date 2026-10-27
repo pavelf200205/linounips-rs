@@ -354,7 +354,7 @@ impl Network {
                     .leaky(self.ops.conv1x1(x, &format!("{F}.resize_layers.2.0")))
             } else {
                 self.ops
-                    .leaky(self.ops.conv(x, &format!("{F}.resize_layers.3.0"), 2, 0))
+                    .leaky(self.ops.conv2x2s2(x, &format!("{F}.resize_layers.3.0")))
             };
             features.push(self.ops.leaky(self.ops.conv(
                 x,
@@ -422,7 +422,13 @@ impl Network {
         )
     }
 
-    fn smooth_nhwc_fast(&self, bands: Vec<Tensor<4>>, canonical: Tensor<4>) -> Tensor<4> {
+    fn smooth_nhwc_fast(
+        &self,
+        b01: Tensor<4>,
+        b23: Tensor<4>,
+        canonical_small: Tensor<4>,
+    ) -> Tensor<4> {
+        let _timer = self.ops.span("smooth");
         if !self.ops.reference_kernels {
             let weights_1d = self.ops.constant("gaussian/1d/21".into(), || {
                 let mut g = Vec::with_capacity(21);
@@ -435,14 +441,23 @@ impl Network {
                 }
                 g
             });
-            if let Some(combined) =
-                crate::geometry::inverse_haar_add(bands.clone(), canonical.clone())
-            {
+            if let Some(combined) = crate::geometry::inverse_haar_add_pair(
+                b01.clone(),
+                b23.clone(),
+                canonical_small.clone(),
+            ) {
                 if let Some(nhwc) = crate::geometry::smooth_nhwc(combined, weights_1d) {
                     return nhwc;
                 }
             }
         }
+        let bands = vec![
+            b01.clone().slice([0..1, 0..256, 0..256, 0..256]),
+            b01.slice([1..2, 0..256, 0..256, 0..256]),
+            b23.clone().slice([0..1, 0..256, 0..256, 0..256]),
+            b23.slice([1..2, 0..256, 0..256, 0..256]),
+        ];
+        let canonical = self.ops.resize(canonical_small, 512, true);
         let x = self.inverse(bands);
         let x = self.smooth(x + canonical);
         x.permute([0, 2, 3, 1])
@@ -456,8 +471,7 @@ impl Network {
             "  [canonical] running multi-scale fusion ({n_lights} lights)..."
         ));
         // Keep canonical fusion outputs at 256x256 (32 MiB/light instead of 128 MiB/light) across
-        // the CPU backing boundary, and upsample to 512x512 on the GPU right when wavelet fusion
-        // consumes them—cutting PCIe transfers and host staging memory by 4x.
+        // the CPU backing boundary, and upsample to 512x512 inside `haar_inverse_add_pair`.
         let c_stride = 256 * 256 * 256;
         let mut canonical_256 = Packed::empty(self.ops.dtype, n_lights * c_stride);
         for f in (0..n_lights).step_by(2) {
@@ -497,20 +511,13 @@ impl Network {
         for f in 0..n_lights {
             let b01 = self.fusion_pair(&stages, f * 4, f * 4 + 1);
             let b23 = self.fusion_pair(&stages, f * 4 + 2, f * 4 + 3);
-            let bands = vec![
-                b01.clone().slice([0..1, 0..256, 0..256, 0..256]),
-                b01.slice([1..2, 0..256, 0..256, 0..256]),
-                b23.clone().slice([0..1, 0..256, 0..256, 0..256]),
-                b23.slice([1..2, 0..256, 0..256, 0..256]),
-            ];
             let can_off = f * c_stride;
             let canonical_small = canonical_256.upload_range(
                 can_off..can_off + c_stride,
                 [1, 256, 256, 256],
                 &self.ops.device,
             );
-            let canonical = self.ops.resize(canonical_small, 512, true);
-            let nhwc = self.smooth_nhwc_fast(bands, canonical);
+            let nhwc = self.smooth_nhwc_fast(b01, b23, canonical_small);
             // Pixel-major host layout makes sample gathering contiguous across channels.
             result.push(self.ops.capture(nhwc));
         }

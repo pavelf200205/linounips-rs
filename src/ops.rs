@@ -53,7 +53,7 @@ impl Ops {
         );
         let expected = crate::schema::expected(pbr);
         let mut raw_linear: HashMap<String, (usize, usize, Vec<f32>)> = HashMap::new();
-        let mut weights = HashMap::with_capacity(expected.len() + 20);
+        let mut weights = HashMap::with_capacity(expected.len() + 24);
         for (name, mut shape) in expected {
             let t = archive.tensor(&name).with_context(|| {
                 format!("Missing required tensor {name}; wrong checkpoint mode or architecture")
@@ -289,6 +289,32 @@ impl Ops {
         out.reshape([b, o, h, w])
     }
 
+    /// Execute a 2x2 stride-2 pad-0 convolution (`resize_layers.3.0`) via disjoint 2x2 patch
+    /// gather + NCHW GEMM without `conv2d` overhead.
+    pub fn conv2x2s2(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
+        if self.reference_kernels {
+            return self.conv(x, p, 2, 0);
+        }
+        let _timer = self.span("conv");
+        let [b, c, h, w] = x.dims();
+        let oh = h / 2;
+        let ow = w / 2;
+        let weight: Tensor<4> = self.w(&format!("{p}.weight"));
+        let o = weight.dims()[0];
+        let patches = x
+            .reshape([b, c, oh, 2, ow, 2])
+            .permute([0, 1, 3, 5, 2, 4])
+            .reshape([b, c * 4, oh * ow]);
+        let out = weight.reshape([1, o, c * 4]).matmul(patches);
+        let bias_key = format!("{p}.bias");
+        let out = if self.has(&bias_key) {
+            out + self.w::<1>(&bias_key).reshape([1, o, 1])
+        } else {
+            out
+        };
+        out.reshape([b, o, oh, ow])
+    }
+
     pub fn conv(&self, x: Tensor<4>, p: &str, stride: usize, pad: usize) -> Tensor<4> {
         let _timer = self.span("conv");
         let bias_key = format!("{p}.bias");
@@ -399,18 +425,28 @@ impl Ops {
                         .reshape([b, n, h * d]);
                 }
             }
-            // Fast path 2: Uniformly aligned query-chunked GEMM + fused subgroup softmax
+            // Fast path 2: Power-of-2 query-chunked GEMM + fused subgroup softmax
             // (covers global_blocks while keeping temporary score buffer <= `score_mib`).
-            let bs = if bh % 2 == 0 && (budget_bytes / (2 * pad_m * elem_bytes)) >= 256 {
-                2
-            } else if (budget_bytes / (bh * pad_m * elem_bytes)) >= 128 {
+            let bs = if (budget_bytes / (bh * pad_m * elem_bytes)) >= 256 {
                 bh
+            } else if bh % 3 == 0 && (budget_bytes / (3 * pad_m * elem_bytes)) >= 256 {
+                3
+            } else if bh % 2 == 0 && (budget_bytes / (2 * pad_m * elem_bytes)) >= 256 {
+                2
             } else {
                 1
             };
             let raw_qs = budget_bytes / (bs * pad_m.max(1) * elem_bytes);
             if raw_qs >= 64 {
-                let qs = (raw_qs / 64 * 64).clamp(64, 1024);
+                let qs = if raw_qs >= 512 {
+                    512
+                } else if raw_qs >= 256 {
+                    256
+                } else if raw_qs >= 128 {
+                    128
+                } else {
+                    64
+                };
                 let pad_n = n.div_ceil(qs) * qs;
                 let q_pad = if pad_n > n {
                     let z = Tensor::<3>::zeros([bh, pad_n - n, d], self.options());
