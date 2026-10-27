@@ -819,7 +819,8 @@ impl Ops {
                 .bytes_reserved
                 .saturating_sub(u.bytes_in_use)
                 .saturating_sub(u.bytes_padding);
-            if self.pool_cache_mib > 0 && unused > self.pool_cache_mib * 1024 * 1024 {
+            let cache_limit_bytes = (self.pool_cache_mib as u64).saturating_mul(1024 * 1024);
+            if self.pool_cache_mib > 0 && unused > cache_limit_bytes {
                 self.device.sync().expect("allocator boundary");
                 self.device.memory_cleanup();
             }
