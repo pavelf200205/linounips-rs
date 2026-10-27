@@ -1,4 +1,5 @@
-//! Portable element kernels: compact LUT embeddings, rotary embeddings and resize.
+//! Portable element kernels: compact LUT embeddings, rotary embeddings, resize,
+//! fused inverse Haar + canonical add, and separable 1D Gaussian smoothing.
 use burn::tensor::Tensor as BurnTensor;
 use burn_backend::{DType, ExecutionError, Shape};
 use burn_cubecl::{
@@ -14,7 +15,9 @@ use burn_fusion::{
     },
 };
 use cubecl::prelude::*;
+
 type Gpu = Fusion<CubeBackend>;
+
 #[cube(launch)]
 fn position<F: Float>(x: &Tensor<F>, lut: &Tensor<f32>, out: &mut Tensor<F>) {
     let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
@@ -22,10 +25,11 @@ fn position<F: Float>(x: &Tensor<F>, lut: &Tensor<f32>, out: &mut Tensor<F>) {
         let w = out.shape(3);
         let h = out.shape(2);
         let c = out.shape(1);
+        let hw = h * w;
         let xx = i % w;
         let y = (i / w) % h;
-        let ch = (i / (h * w)) % c;
-        let b = i / (h * w * c);
+        let ch = (i / hw) % c;
+        let b = i / (hw * c);
         let mut coordinate = xx;
         if ch >= c / 2 {
             coordinate = y;
@@ -40,6 +44,7 @@ fn position<F: Float>(x: &Tensor<F>, lut: &Tensor<f32>, out: &mut Tensor<F>) {
         out[i] = F::cast_from(value + lut[ch * length + coordinate]);
     }
 }
+
 #[cube(launch)]
 fn rotary<F: Float>(x: &Tensor<F>, lut: &Tensor<f32>, pos: &Tensor<f32>, out: &mut Tensor<F>) {
     let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
@@ -47,31 +52,32 @@ fn rotary<F: Float>(x: &Tensor<F>, lut: &Tensor<f32>, pos: &Tensor<f32>, out: &m
         let d = out.shape(3);
         let n = out.shape(2);
         let heads = out.shape(1);
+        let dn = d * n;
         let ch = i % d;
         let q = (i / d) % n;
-        let head = (i / (d * n)) % heads;
-        let b = i / (d * n * heads);
+        let head = (i / dn) % heads;
+        let b = i / (dn * heads);
         let half = d / 2;
         let quarter = d / 4;
         let axis = ch / half;
         let local = ch % half;
         let coordinate = usize::cast_from(pos[(b * n + q) * 2 + axis]);
         let lut_i = (coordinate * half + local) * 2;
-        let mut paired = ch;
+        let mut paired = ch - quarter;
         let mut sign = f32::new(1.0_f32);
         if local < quarter {
             paired = ch + quarter;
             sign = -1.0_f32;
-        } else {
-            paired = ch - quarter;
         }
         let base = b * x.stride(0) + head * x.stride(1) + q * x.stride(2);
-        let value = f32::cast_from(x[base + ch * x.stride(3)]);
-        let rotated = f32::cast_from(x[base + paired * x.stride(3)]) * sign;
+        let s3 = x.stride(3);
+        let value = f32::cast_from(x[base + ch * s3]);
+        let rotated = f32::cast_from(x[base + paired * s3]) * sign;
         // Match the reference's half-precision multiplies before the addition.
         out[i] = F::cast_from(value * lut[lut_i]) + F::cast_from(rotated * lut[lut_i + 1]);
     }
 }
+
 #[cube(launch)]
 fn bilinear<F: Float>(x: &Tensor<F>, out: &mut Tensor<F>, #[comptime] align: bool) {
     let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
@@ -79,10 +85,11 @@ fn bilinear<F: Float>(x: &Tensor<F>, out: &mut Tensor<F>, #[comptime] align: boo
         let w = out.shape(3);
         let h = out.shape(2);
         let c = out.shape(1);
+        let hw = h * w;
         let ox = i % w;
         let oy = (i / w) % h;
-        let ch = (i / (h * w)) % c;
-        let b = i / (h * w * c);
+        let ch = (i / hw) % c;
+        let b = i / (hw * c);
         let iw = x.shape(3);
         let ih = x.shape(2);
         let mut fy = f32::new(0.0_f32);
@@ -123,15 +130,100 @@ fn bilinear<F: Float>(x: &Tensor<F>, out: &mut Tensor<F>, #[comptime] align: boo
         let ay = fy - f32::cast_from(y0);
         let ax = fx - f32::cast_from(x0);
         let base = b * x.stride(0) + ch * x.stride(1);
-        let a = f32::cast_from(x[base + y0 * x.stride(2) + x0 * x.stride(3)]);
-        let bb = f32::cast_from(x[base + y0 * x.stride(2) + x1 * x.stride(3)]);
-        let cc = f32::cast_from(x[base + y1 * x.stride(2) + x0 * x.stride(3)]);
-        let dd = f32::cast_from(x[base + y1 * x.stride(2) + x1 * x.stride(3)]);
+        let s2 = x.stride(2);
+        let s3 = x.stride(3);
+        let row0 = base + y0 * s2;
+        let row1 = base + y1 * s2;
+        let a = f32::cast_from(x[row0 + x0 * s3]);
+        let bb = f32::cast_from(x[row0 + x1 * s3]);
+        let cc = f32::cast_from(x[row1 + x0 * s3]);
+        let dd = f32::cast_from(x[row1 + x1 * s3]);
         let top = a + (bb - a) * ax;
         let bottom = cc + (dd - cc) * ax;
         out[i] = F::cast_from(top + (bottom - top) * ay);
     }
 }
+
+#[cube(launch)]
+fn haar_inverse_add<F: Float>(
+    b0: &Tensor<F>,
+    b1: &Tensor<F>,
+    b2: &Tensor<F>,
+    b3: &Tensor<F>,
+    canonical: &Tensor<F>,
+    out: &mut Tensor<F>,
+) {
+    let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
+    if i < out.len() {
+        let ox = i % 512usize;
+        let oy = (i / 512usize) % 512usize;
+        let ch = i / 262144usize;
+        let xx = ox / 2usize;
+        let yy = oy / 2usize;
+        let dx = ox % 2usize;
+        let dy = oy % 2usize;
+        let idx = (ch * 256usize + yy) * 256usize + xx;
+        let v0 = f32::cast_from(b0[idx]);
+        let v1 = f32::cast_from(b1[idx]);
+        let v2 = f32::cast_from(b2[idx]);
+        let v3 = f32::cast_from(b3[idx]);
+        let mut s1 = f32::new(1.0_f32);
+        if dy != 0usize {
+            s1 = -1.0_f32;
+        }
+        let mut s2 = f32::new(1.0_f32);
+        if dx != 0usize {
+            s2 = -1.0_f32;
+        }
+        let inv = F::cast_from((v0 + v1 * s1 + v2 * s2 + v3 * s1 * s2) * 0.5_f32);
+        out[i] = F::cast_from(f32::cast_from(inv) + f32::cast_from(canonical[i]));
+    }
+}
+
+#[cube(launch)]
+fn gaussian_h<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F>) {
+    let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
+    if i < out.len() {
+        let ox = i % 512usize;
+        let row_base = i - ox;
+        let mut sum = f32::new(0.0_f32);
+        #[unroll]
+        for k in 0..21usize {
+            let shifted = ox + k;
+            if shifted >= 10usize {
+                let ix = shifted - 10usize;
+                if ix < 512usize {
+                    sum += f32::cast_from(x[row_base + ix]) * weights[k];
+                }
+            }
+        }
+        out[i] = F::cast_from(sum);
+    }
+}
+
+#[cube(launch)]
+fn gaussian_v_nhwc<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F>) {
+    let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
+    if i < out.len() {
+        let ch = i % 256usize;
+        let ox = (i / 256usize) % 512usize;
+        let oy = i / 131072usize;
+        let col_base = ch * 262144usize + ox;
+        let mut sum = f32::new(0.0_f32);
+        #[unroll]
+        for k in 0..21usize {
+            let shifted = oy + k;
+            if shifted >= 10usize {
+                let iy = shifted - 10usize;
+                if iy < 512usize {
+                    sum += f32::cast_from(x[col_base + iy * 512usize]) * weights[k];
+                }
+            }
+        }
+        out[i] = F::cast_from(sum);
+    }
+}
+
 #[derive(Debug)]
 struct GeometryOp {
     desc: CustomOpIr,
@@ -191,7 +283,7 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
                             result.clone().into_tensor_arg(),
                         );
                     }
-                    _ => {
+                    2 => {
                         bilinear::launch::<$ty>(
                             &client,
                             count,
@@ -199,6 +291,45 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
                             x.into_tensor_arg(),
                             result.clone().into_tensor_arg(),
                             self.align,
+                        );
+                    }
+                    3 => {
+                        let b1 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        let b2 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[2]);
+                        let b3 = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[3]);
+                        let can = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[4]);
+                        haar_inverse_add::launch::<$ty>(
+                            &client,
+                            count,
+                            dim,
+                            x.into_tensor_arg(),
+                            b1.into_tensor_arg(),
+                            b2.into_tensor_arg(),
+                            b3.into_tensor_arg(),
+                            can.into_tensor_arg(),
+                            result.clone().into_tensor_arg(),
+                        );
+                    }
+                    4 => {
+                        let weights = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        gaussian_h::launch::<$ty>(
+                            &client,
+                            count,
+                            dim,
+                            x.into_tensor_arg(),
+                            weights.into_tensor_arg(),
+                            result.clone().into_tensor_arg(),
+                        );
+                    }
+                    _ => {
+                        let weights = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        gaussian_v_nhwc::launch::<$ty>(
+                            &client,
+                            count,
+                            dim,
+                            x.into_tensor_arg(),
+                            weights.into_tensor_arg(),
+                            result.clone().into_tensor_arg(),
                         );
                     }
                 }
@@ -214,9 +345,11 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
         Ok(())
     }
 }
+
 fn register(
     x: BurnTensor<4>,
-    extras: Vec<BurnTensor<1>>,
+    extras_4d: Vec<BurnTensor<4>>,
+    extras_1d: Vec<BurnTensor<1>>,
     kind: u8,
     shape: [usize; 4],
     align: bool,
@@ -224,7 +357,10 @@ fn register(
     let x = x.inner().try_into_primitive::<Gpu>().ok()?;
     let client = x.client.clone();
     let mut inputs = vec![x.into_ir()];
-    for t in extras {
+    for t in extras_4d {
+        inputs.push(t.inner().try_into_primitive::<Gpu>().ok()?.into_ir());
+    }
+    for t in extras_1d {
         inputs.push(t.inner().try_into_primitive::<Gpu>().ok()?.into_ir());
     }
     let out = TensorIr::uninit(
@@ -250,15 +386,44 @@ fn register(
         .outputs();
     Some(BurnTensor::from_primitive::<Gpu>(out))
 }
+
 pub fn add_position(x: BurnTensor<4>, lut: BurnTensor<1>) -> Option<BurnTensor<4>> {
     let shape = x.dims();
-    register(x, vec![lut], 0, shape, false)
+    register(x, vec![], vec![lut], 0, shape, false)
 }
+
 pub fn rope(x: BurnTensor<4>, lut: BurnTensor<1>, pos: BurnTensor<1>) -> Option<BurnTensor<4>> {
     let shape = x.dims();
-    register(x, vec![lut, pos], 1, shape, false)
+    register(x, vec![], vec![lut, pos], 1, shape, false)
 }
+
 pub fn resize(x: BurnTensor<4>, size: usize, align: bool) -> Option<BurnTensor<4>> {
     let [b, c, _, _] = x.dims();
-    register(x, vec![], 2, [b, c, size, size], align)
+    register(x, vec![], vec![], 2, [b, c, size, size], align)
+}
+
+pub fn inverse_haar_add(
+    mut bands: Vec<BurnTensor<4>>,
+    canonical: BurnTensor<4>,
+) -> Option<BurnTensor<4>> {
+    if bands.len() != 4 {
+        return None;
+    }
+    let b3 = bands.pop()?;
+    let b2 = bands.pop()?;
+    let b1 = bands.pop()?;
+    let b0 = bands.pop()?;
+    register(
+        b0,
+        vec![b1, b2, b3, canonical],
+        vec![],
+        3,
+        [1, 256, 512, 512],
+        false,
+    )
+}
+
+pub fn smooth_nhwc(x: BurnTensor<4>, weights_1d: BurnTensor<1>) -> Option<BurnTensor<4>> {
+    let h = register(x, vec![], vec![weights_1d.clone()], 4, [1, 256, 512, 512], false)?;
+    register(h, vec![], vec![weights_1d], 5, [1, 512, 512, 256], false)
 }

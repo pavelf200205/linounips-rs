@@ -9,15 +9,16 @@ mod output;
 mod progress;
 mod schema;
 use anyhow::{Context, Result, ensure};
-use burn::tensor::{Device, DeviceKind, FloatDType};
+use burn::tensor::{Device, DeviceKind, FloatDType, Tensor};
 use clap::{Parser, Subcommand, ValueEnum};
-use host::{Packed, read, upload};
+use host::{gather_samples, read};
 use input::{Input, Rng};
 use output::Map;
 use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
     Standard,
@@ -37,12 +38,12 @@ struct Cli {
     #[arg(long,global=true,default_value="auto",value_parser=["auto","bf16","fp16","fp32"])]
     precision: String,
     /// Independent per-image encoder batch; global attention always sees every light.
-    #[arg(long, global = true, default_value_t = 2)]
+    #[arg(long, global = true, default_value_t = 4)]
     encoder_batch: usize,
     /// Semantic pixel sampling group size. Changing this may change predictions.
     #[arg(long, global = true, default_value_t = 2048)]
     pixel_batch: usize,
-    /// GEMM fallback score-temporary budget; fused attention does not allocate dense scores.
+    /// GEMM score-temporary budget in MiB.
     #[arg(long, global = true, default_value_t = 64)]
     score_budget_mib: usize,
     /// Estimated queued temporary-work budget; live model/features are separate.
@@ -51,10 +52,10 @@ struct Cli {
     /// Use the tensor-operation fallbacks for attention, geometry and LayerNorm.
     #[arg(long, global = true)]
     reference_kernels: bool,
-    /// Print block timings and write profile.json (wall-clock timings, not device timestamps).
+    /// Print detailed block timings and write profile.json (wall-clock timings, not device timestamps).
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
-    /// Disable terminal progress and periodic progress lines in redirected output.
+    /// Disable process log messages on stderr.
     #[arg(long, global = true)]
     no_progress: bool,
 }
@@ -265,7 +266,7 @@ fn main() -> Result<()> {
             .to_string_lossy();
         let view_progress = progress::view(&view_name, view_index + 1, total_views);
         let start = Instant::now();
-        let loading = progress::phase("load and normalize images", 1, "view");
+        progress::message(format!("Loading and normalizing images from {}...", object.display()));
         let input = Input::load(
             &object,
             images,
@@ -275,7 +276,6 @@ fn main() -> Result<()> {
             &normalization,
             &mut rng,
         )?;
-        drop(loading);
         let input_seconds = start.elapsed().as_secs_f64();
         net.ops.reset_timings();
         let inference = Instant::now();
@@ -290,7 +290,7 @@ fn main() -> Result<()> {
             ]);
         }
         progress::message(format!(
-            "{}: {n} lights, {}px, {} interleaved blocks",
+            "{}: {n} lights, {}px, {} interleaved blocks (loaded in {input_seconds:.2}s)",
             object.display(),
             input.size,
             grid * grid
@@ -306,32 +306,30 @@ fn main() -> Result<()> {
                 .filter_map(|(i, v)| v.then_some(i))
                 .collect();
             if ids.is_empty() {
+                progress::message(format!("  Block {}/{}: skipped (0 foreground pixels)", block + 1, grid * grid));
                 continue;
             }
-            let masked: Vec<_> = rgb
-                .iter()
-                .map(|im| {
-                    let mut v = im.range(0..im.len());
-                    for c in 0..3 {
-                        for (i, m) in mask.iter().enumerate() {
-                            if !*m {
-                                v[c * 512 * 512 + i] = 0.;
-                            }
-                        }
-                    }
-                    Packed::new(v, dtype)
-                })
-                .collect();
+            let masked: Vec<_> = rgb.iter().map(|im| im.zero_masked_planar(&mask)).collect();
             let features = net.encode(&masked);
             drop(masked);
+            let rgb_pixel_major: Vec<_> = rgb
+                .iter()
+                .map(|im| im.planar_to_interleaved_rgb(512 * 512))
+                .collect();
+            drop(rgb);
             let encode_seconds = began.elapsed().as_secs_f64();
             rng.shuffle(&mut ids);
             rng.shuffle(&mut ids);
             let groups = ids.len() / cli.pixel_batch + 1;
             let base = ids.len() / groups;
             let extra = ids.len() % groups;
+            progress::message(format!(
+                "  Block {}/{}: encoder finished in {encode_seconds:.2}s | decoding {} pixels in {groups} batches...",
+                block + 1,
+                grid * grid,
+                ids.len()
+            ));
             let mut at = 0;
-            let decoding = progress::phase("decode sampled pixels", ids.len(), "pixels");
             let mut prefetched = None;
             for group in 0..groups {
                 let count = base + usize::from(group < extra);
@@ -342,9 +340,9 @@ fn main() -> Result<()> {
                 }
                 let (colors, f) = prefetched
                     .take()
-                    .unwrap_or_else(|| gather_inputs(&rgb, &features, set, dtype));
+                    .unwrap_or_else(|| gather_samples(&rgb_pixel_major, &features, set, dtype));
                 let predictions = net.decode(
-                    upload(colors, [count, n, 3], &net.ops.device, dtype),
+                    colors.into_tensor([count, n, 3], &net.ops.device),
                     f.into_tensor([count, n, 256], &net.ops.device),
                 );
                 // Submit the current GPU work, then gather the next CPU batch while
@@ -353,46 +351,63 @@ fn main() -> Result<()> {
                 if group + 1 < groups {
                     let next_count = base + usize::from(group + 1 < extra);
                     if next_count > 0 {
-                        prefetched = Some(gather_inputs(
-                            &rgb,
+                        prefetched = Some(gather_samples(
+                            &rgb_pixel_major,
                             &features,
                             &ids[at..at + next_count],
                             dtype,
                         ));
                     }
                 }
-                for (name, tensor) in predictions {
+                if predictions.len() == 1 {
+                    let (name, tensor) = predictions.into_iter().next().unwrap();
                     let values = read(tensor);
                     let map = maps.iter_mut().find(|m| m.name == name).unwrap();
+                    let ch = map.channels;
                     for (i, &pixel) in set.iter().enumerate() {
                         let y = (pixel / 512) * grid + block / grid;
                         let x = (pixel % 512) * grid + block % grid;
-                        let dst = (y * input.size + x) * map.channels;
-                        map.values[dst..dst + map.channels]
-                            .copy_from_slice(&values[i * map.channels..(i + 1) * map.channels]);
+                        let dst = (y * input.size + x) * ch;
+                        map.values[dst..dst + ch].copy_from_slice(&values[i * ch..(i + 1) * ch]);
+                    }
+                } else {
+                    let meta: Vec<(String, usize)> = predictions
+                        .iter()
+                        .map(|(name, t)| (name.clone(), t.dims()[2]))
+                        .collect();
+                    let total_ch: usize = meta.iter().map(|(_, c)| *c).sum();
+                    let tensors: Vec<_> = predictions.into_iter().map(|(_, t)| t).collect();
+                    let combined = read(Tensor::cat(tensors, 2));
+                    let mut ch_offset = 0;
+                    for (name, ch) in meta {
+                        let map = maps.iter_mut().find(|m| m.name == name).unwrap();
+                        for (i, &pixel) in set.iter().enumerate() {
+                            let y = (pixel / 512) * grid + block / grid;
+                            let x = (pixel % 512) * grid + block % grid;
+                            let dst = (y * input.size + x) * ch;
+                            let src = i * total_ch + ch_offset;
+                            map.values[dst..dst + ch].copy_from_slice(&combined[src..src + ch]);
+                        }
+                        ch_offset += ch;
                     }
                 }
                 // Readback above already completes the predictions. No new GPU wait.
-                decoding.set(at);
             }
-            drop(decoding);
             drop(features);
             net.ops.trim_after_readback();
             let elapsed = began.elapsed().as_secs_f64();
-            if cli.verbose {
-                progress::message(format!(
-                    "Block {}/{}: encoder {encode_seconds:.2}s, total {elapsed:.2}s",
-                    block + 1,
-                    grid * grid
-                ));
-            }
+            let decode_seconds = elapsed - encode_seconds;
+            progress::message(format!(
+                "  Block {}/{}: completed in {elapsed:.2}s (encoder {encode_seconds:.2}s, decoder {decode_seconds:.2}s)",
+                block + 1,
+                grid * grid
+            ));
             profile.push(serde_json::json!({"block":block,"encoder_seconds":encode_seconds,"seconds":elapsed,"foreground":ids.len()}));
         }
         let inference_seconds = inference.elapsed().as_secs_f64();
-        let saving = progress::phase("save output maps", maps.len(), "maps");
-        for (index, map) in maps.iter().enumerate() {
+        progress::message(format!("Saving {} output map(s) to {}...", maps.len(), dir.display()));
+        for map in &maps {
             output::save(map, &input, &dir, &formats)?;
-            saving.set(index + 1);
         }
         let metadata = serde_json::json!({"revision":env!("LINO_REVISION"),"upstream":"4ddb4113d0196b853978d2cc72de582611b01ebd","model":model,"mode":format!("{mode:?}"),"precision":format!("{dtype:?}"),"device":format!("{:?}",net.ops.device.identity()),"images":n,"size":input.size,"files":input.files,"roi":input.roi,"normalization":normalization,"seed":seed,"pixel_batch":cli.pixel_batch,"encoder_batch":cli.encoder_batch,"score_budget_mib":cli.score_budget_mib,"inflight_mib":cli.inflight_mib,"reference_kernels":cli.reference_kernels,"attention_dispatch_totals":fast_attention::stats(),"operation_timings":net.ops.timing_report(),"input_seconds":input_seconds,"inference_seconds":inference_seconds,"seconds":start.elapsed().as_secs_f64(),"material_mapping":"clamp(raw,-1,1)*0.5+0.5; diffuse is upstream baseColor","normal_axes":"upstream xyz","formats":formats});
         std::fs::write(
@@ -407,7 +422,6 @@ fn main() -> Result<()> {
                 )?,
             )?;
         }
-        drop(saving);
         view_progress.finish();
         println!(
             "Saved {} ({inference_seconds:.2}s inference)",
@@ -415,24 +429,4 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn gather_inputs(
-    rgb: &[Packed],
-    features: &[Packed],
-    pixels: &[usize],
-    dtype: FloatDType,
-) -> (Vec<f32>, Packed) {
-    let n = rgb.len();
-    let mut packed = Packed::empty(dtype, pixels.len() * n * 256);
-    let mut colors = Vec::with_capacity(pixels.len() * n * 3);
-    for &pixel in pixels {
-        for light in 0..n {
-            packed.extend_range(&features[light], pixel * 256..(pixel + 1) * 256);
-            for c in 0..3 {
-                colors.push(rgb[light].get(c * 512 * 512 + pixel));
-            }
-        }
-    }
-    (colors, packed)
 }

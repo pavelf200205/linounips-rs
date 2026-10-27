@@ -2,6 +2,7 @@ use crate::host::Packed;
 use anyhow::{Context, Result, ensure};
 use burn::tensor::FloatDType;
 use std::path::{Path, PathBuf};
+
 // Legacy NumPy RandomState MT19937: stable shuffles without altering pixel groups.
 pub struct Rng {
     state: [u32; 624],
@@ -62,6 +63,8 @@ impl Rng {
         }
     }
 }
+
+#[inline]
 fn cubic(x: f64) -> f64 {
     let x = x.abs();
     if x <= 1. {
@@ -72,40 +75,91 @@ fn cubic(x: f64) -> f64 {
         0.
     }
 }
-// OpenCV INTER_CUBIC convention (a=-0.75, half-pixel coordinates).
-pub fn resize_cubic(src: &[f32], w: usize, h: usize, c: usize, size: usize) -> Vec<f32> {
-    let mut temp = vec![0.; h * size * c];
-    for y in 0..h {
-        for ox in 0..size {
-            let f = (ox as f64 + 0.5) * w as f64 / size as f64 - 0.5;
+
+fn cubic_table(in_len: usize, out_len: usize, c: usize) -> Vec<([usize; 4], [f64; 4])> {
+    let max_i = in_len as isize - 1;
+    (0..out_len)
+        .map(|o| {
+            let f = (o as f64 + 0.5) * in_len as f64 / out_len as f64 - 0.5;
             let base = f.floor() as isize;
-            for ch in 0..c {
-                let mut sum = 0.;
-                for j in -1..=2 {
-                    let ix = (base + j).clamp(0, w as isize - 1) as usize;
-                    sum += src[(y * w + ix) * c + ch] as f64 * cubic(f - (base + j) as f64);
+            let idx = [
+                ((base - 1).clamp(0, max_i) as usize) * c,
+                (base.clamp(0, max_i) as usize) * c,
+                ((base + 1).clamp(0, max_i) as usize) * c,
+                ((base + 2).clamp(0, max_i) as usize) * c,
+            ];
+            let w = [
+                cubic(f - (base - 1) as f64),
+                cubic(f - base as f64),
+                cubic(f - (base + 1) as f64),
+                cubic(f - (base + 2) as f64),
+            ];
+            (idx, w)
+        })
+        .collect()
+}
+
+fn crop_roi(data: &[f32], w: usize, roi: [usize; 4], c: usize) -> Vec<f32> {
+    let [ys, ye, xs, xe] = roi;
+    let rw = xe - xs;
+    let rh = ye - ys;
+    let mut out = Vec::with_capacity(rw * rh * c);
+    for y in ys..ye {
+        out.extend_from_slice(&data[(y * w + xs) * c..(y * w + xe) * c]);
+    }
+    out
+}
+
+// OpenCV INTER_CUBIC convention (a=-0.75, half-pixel coordinates) with precomputed tap tables.
+pub fn resize_cubic(src: &[f32], w: usize, h: usize, c: usize, size: usize) -> Vec<f32> {
+    let x_taps = cubic_table(w, size, c);
+    let y_taps = cubic_table(h, size, 1);
+    let mut temp = vec![0.; h * size * c];
+    let row_in_stride = w * c;
+    let row_tmp_stride = size * c;
+    for y in 0..h {
+        let src_row = &src[y * row_in_stride..(y + 1) * row_in_stride];
+        let dst_row = &mut temp[y * row_tmp_stride..(y + 1) * row_tmp_stride];
+        if c == 3 {
+            for (ox, &(idx, wt)) in x_taps.iter().enumerate() {
+                let d = ox * 3;
+                for ch in 0..3 {
+                    let sum = src_row[idx[0] + ch] as f64 * wt[0]
+                        + src_row[idx[1] + ch] as f64 * wt[1]
+                        + src_row[idx[2] + ch] as f64 * wt[2]
+                        + src_row[idx[3] + ch] as f64 * wt[3];
+                    dst_row[d + ch] = sum as f32;
                 }
-                temp[(y * size + ox) * c + ch] = sum as f32;
+            }
+        } else {
+            for (ox, &(idx, wt)) in x_taps.iter().enumerate() {
+                let d = ox * c;
+                for ch in 0..c {
+                    let sum = src_row[idx[0] + ch] as f64 * wt[0]
+                        + src_row[idx[1] + ch] as f64 * wt[1]
+                        + src_row[idx[2] + ch] as f64 * wt[2]
+                        + src_row[idx[3] + ch] as f64 * wt[3];
+                    dst_row[d + ch] = sum as f32;
+                }
             }
         }
     }
     let mut out = vec![0.; size * size * c];
-    for oy in 0..size {
-        let f = (oy as f64 + 0.5) * h as f64 / size as f64 - 0.5;
-        let base = f.floor() as isize;
-        for x in 0..size {
-            for ch in 0..c {
-                let mut sum = 0.;
-                for j in -1..=2 {
-                    let iy = (base + j).clamp(0, h as isize - 1) as usize;
-                    sum += temp[(iy * size + x) * c + ch] as f64 * cubic(f - (base + j) as f64);
-                }
-                out[(oy * size + x) * c + ch] = sum as f32;
-            }
+    for (oy, &(idx, wt)) in y_taps.iter().enumerate() {
+        let r0 = &temp[idx[0] * row_tmp_stride..(idx[0] + 1) * row_tmp_stride];
+        let r1 = &temp[idx[1] * row_tmp_stride..(idx[1] + 1) * row_tmp_stride];
+        let r2 = &temp[idx[2] * row_tmp_stride..(idx[2] + 1) * row_tmp_stride];
+        let r3 = &temp[idx[3] * row_tmp_stride..(idx[3] + 1) * row_tmp_stride];
+        let dst_row = &mut out[oy * row_tmp_stride..(oy + 1) * row_tmp_stride];
+        let [w0, w1, w2, w3] = wt;
+        for i in 0..row_tmp_stride {
+            let sum = r0[i] as f64 * w0 + r1[i] as f64 * w1 + r2[i] as f64 * w2 + r3[i] as f64 * w3;
+            dst_row[i] = sum as f32;
         }
     }
     out
 }
+
 pub struct Input {
     pub images: Vec<Packed>,
     pub mask: Vec<bool>,
@@ -116,6 +170,7 @@ pub struct Input {
     pub roi: [usize; 4],
     pub files: Vec<PathBuf>,
 }
+
 impl Input {
     pub fn load(
         dir: &Path,
@@ -167,8 +222,9 @@ impl Input {
         let mut xmin = w;
         let mut xmax = 0;
         for y in 0..h {
-            for x in 0..w {
-                if original_mask[y * w + x] > 0. {
+            let row = &original_mask[y * w..(y + 1) * w];
+            for (x, &val) in row.iter().enumerate() {
+                if val > 0. {
                     ymin = ymin.min(y);
                     ymax = ymax.max(y);
                     xmin = xmin.min(x);
@@ -203,62 +259,87 @@ impl Input {
         let size = ((rh.max(rw) / 512) * 512)
             .max(512)
             .min(max_resolution / 512 * 512);
-        let crop = |data: &[f32], c: usize| {
-            let mut out = Vec::with_capacity(rw * rh * c);
-            for y in ys..ye {
-                out.extend_from_slice(&data[(y * w + xs) * c..(y * w + xe) * c]);
-            }
-            out
-        };
-        let mask: Vec<bool> = resize_cubic(&crop(&original_mask, 1), rw, rh, 1, size)
+        let mask: Vec<bool> = resize_cubic(&crop_roi(&original_mask, w, roi, 1), rw, rh, 1, size)
             .into_iter()
             .map(|v| v > 0.5)
             .collect();
         let count = mask.iter().filter(|v| **v).count();
         ensure!(count > 0, "Resized mask is empty");
-        let mut images = Vec::new();
-        for file in &files {
-            let im = image::open(file).with_context(|| format!("Read {}", file.display()))?;
-            ensure!(
-                im.width() as usize == w && im.height() as usize == h,
-                "Image dimensions differ"
-            );
-            let depth = match im.color() {
-                image::ColorType::Rgb8
-                | image::ColorType::Rgba8
-                | image::ColorType::L8
-                | image::ColorType::La8 => 255.,
-                image::ColorType::Rgb16
-                | image::ColorType::Rgba16
-                | image::ColorType::L16
-                | image::ColorType::La16 => 65535.,
-                _ => 0.,
-            };
-            let data = im.to_rgb32f().into_raw();
-            drop(im);
-            let mut data = resize_cubic(&crop(&data, 3), rw, rh, 3, size);
-            if depth > 0. {
-                for v in &mut data {
-                    *v = (*v * depth).round().clamp(0., depth) / depth;
-                }
+
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(files.len().max(1));
+        let chunk_size = files.len().div_ceil(workers);
+        let mask_slice = mask.as_slice();
+        let mut decoded: Vec<Result<(Vec<f32>, f64, f32)>> = Vec::with_capacity(files.len());
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for chunk in files.chunks(chunk_size) {
+                handles.push(s.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for file in chunk {
+                        let res = (|| -> Result<(Vec<f32>, f64, f32)> {
+                            let im = image::open(file)
+                                .with_context(|| format!("Read {}", file.display()))?;
+                            ensure!(
+                                im.width() as usize == w && im.height() as usize == h,
+                                "Image dimensions differ"
+                            );
+                            let depth = match im.color() {
+                                image::ColorType::Rgb8
+                                | image::ColorType::Rgba8
+                                | image::ColorType::L8
+                                | image::ColorType::La8 => 255.,
+                                image::ColorType::Rgb16
+                                | image::ColorType::Rgba16
+                                | image::ColorType::L16
+                                | image::ColorType::La16 => 65535.,
+                                _ => 0.,
+                            };
+                            let data = im.to_rgb32f().into_raw();
+                            drop(im);
+                            let mut data =
+                                resize_cubic(&crop_roi(&data, w, roi, 3), rw, rh, 3, size);
+                            if depth > 0. {
+                                let inv_depth = 1.0 / depth;
+                                for v in &mut data {
+                                    *v = (*v * depth).round().clamp(0., depth) * inv_depth;
+                                }
+                            }
+                            let mut mean = 0f64;
+                            let mut max = 0f32;
+                            for (i, &m) in mask_slice.iter().enumerate() {
+                                if m {
+                                    let v = (data[3 * i] + data[3 * i + 1] + data[3 * i + 2]) / 3.;
+                                    mean += v as f64;
+                                    max = max.max(v);
+                                }
+                            }
+                            Ok((data, mean, max))
+                        })();
+                        out.push(res);
+                    }
+                    out
+                }));
             }
-            let mut mean = 0f64;
-            let mut max = 0f32;
-            for (i, m) in mask.iter().enumerate() {
-                if *m {
-                    let v = (data[3 * i] + data[3 * i + 1] + data[3 * i + 2]) / 3.;
-                    mean += v as f64;
-                    max = max.max(v);
-                }
+            for h in handles {
+                decoded.extend(h.join().expect("image loader worker panicked"));
             }
+        });
+
+        let mut images = Vec::with_capacity(files.len());
+        for item in decoded {
+            let (mut data, mean, max) = item?;
             let scale = if normalization == "eval" {
                 let a = rng.uniform();
                 (1. - a) * (mean / count as f64) as f32 + a * max
             } else {
                 max
             };
+            let denom = scale + 1e-6;
             for v in &mut data {
-                *v /= scale + 1e-6;
+                *v /= denom;
             }
             images.push(Packed::new(data, dtype));
         }
@@ -273,26 +354,63 @@ impl Input {
             files,
         })
     }
+
     // tile_stride is an interleaved grid, not contiguous image crops.
-    pub fn block(&self, k: usize, dtype: FloatDType) -> (Vec<Packed>, Vec<bool>) {
+    pub fn block(&self, k: usize, _dtype: FloatDType) -> (Vec<Packed>, Vec<bool>) {
         let s = self.size / 512;
         let by = k / s;
         let bx = k % s;
-        let mut mask = vec![false; 512 * 512];
-        let mut images = Vec::new();
-        for image in &self.images {
-            let mut v = vec![0.; 3 * 512 * 512];
-            for y in 0..512 {
-                for x in 0..512 {
-                    let p = (y * s + by) * self.size + x * s + bx;
-                    mask[y * 512 + x] = self.mask[p];
-                    for c in 0..3 {
-                        v[(c * 512 + y) * 512 + x] = image.get(p * 3 + c);
-                    }
-                }
+        let plane = 512 * 512;
+        let mut mask = vec![false; plane];
+        let mut indices = vec![0usize; plane];
+        for y in 0..512 {
+            let row_base = (y * s + by) * self.size + bx;
+            let dst_base = y * 512;
+            for x in 0..512 {
+                let p = row_base + x * s;
+                mask[dst_base + x] = self.mask[p];
+                indices[dst_base + x] = p * 3;
             }
-            images.push(Packed::new(v, dtype));
         }
+        let images = self
+            .images
+            .iter()
+            .map(|image| match image {
+                Packed::F16(src) => {
+                    let mut v = vec![half::f16::ZERO; 3 * plane];
+                    let (r, rest) = v.split_at_mut(plane);
+                    let (g, b) = rest.split_at_mut(plane);
+                    for (i, &p3) in indices.iter().enumerate() {
+                        r[i] = src[p3];
+                        g[i] = src[p3 + 1];
+                        b[i] = src[p3 + 2];
+                    }
+                    Packed::F16(v)
+                }
+                Packed::BF16(src) => {
+                    let mut v = vec![half::bf16::ZERO; 3 * plane];
+                    let (r, rest) = v.split_at_mut(plane);
+                    let (g, b) = rest.split_at_mut(plane);
+                    for (i, &p3) in indices.iter().enumerate() {
+                        r[i] = src[p3];
+                        g[i] = src[p3 + 1];
+                        b[i] = src[p3 + 2];
+                    }
+                    Packed::BF16(v)
+                }
+                Packed::F32(src) => {
+                    let mut v = vec![0.0f32; 3 * plane];
+                    let (r, rest) = v.split_at_mut(plane);
+                    let (g, b) = rest.split_at_mut(plane);
+                    for (i, &p3) in indices.iter().enumerate() {
+                        r[i] = src[p3];
+                        g[i] = src[p3 + 1];
+                        b[i] = src[p3 + 2];
+                    }
+                    Packed::F32(v)
+                }
+            })
+            .collect();
         (images, mask)
     }
 }

@@ -4,3 +4,4 @@
 *.pth
 *.safetensors
 __pycache__/
+lino-rs.zip
