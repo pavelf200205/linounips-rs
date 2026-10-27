@@ -223,7 +223,7 @@ impl Network {
             .flat_map(|p| std::iter::repeat_n(*p, n))
             .collect();
         let light_batch = if n <= 18 { 1031 } else { 516 };
-        let capture_batch = (self.ops.inflight_mib / 8).clamp(1, 8);
+        let capture_batch = (self.ops.inflight_mib / 4).clamp(1, 18);
         let mut stages = Vec::with_capacity(4);
         for i in 0..4 {
             if self.verbose {
@@ -315,8 +315,10 @@ impl Network {
             x
         };
         let x = self.residual(x, &format!("{p}.resConfUnit2"));
-        let x = self.ops.resize(x, size, true);
-        self.ops.conv(x, &format!("{p}.out_conv"), 1, 0)
+        // Commute 1x1 `out_conv` before bilinear `resize` (mathematically identical since
+        // bilinear weights sum to 1.0) to execute `out_conv` on 4x fewer pixels in NCHW GEMM.
+        let x = self.ops.conv1x1(x, &format!("{p}.out_conv"));
+        self.ops.resize(x, size, true)
     }
 
     fn fusion_pair(&self, stages: &[Packed], s0: usize, s1: usize) -> Tensor<4> {
@@ -335,7 +337,7 @@ impl Network {
             };
             let x = self
                 .ops
-                .leaky(self.ops.conv(x, &format!("{F}.projects.{layer}.0"), 1, 0));
+                .leaky(self.ops.conv1x1(x, &format!("{F}.projects.{layer}.0")));
             let x = self.ops.position(x);
             let x = if layer < 2 {
                 let x = self
@@ -347,13 +349,12 @@ impl Network {
                 } else {
                     x
                 }
+            } else if layer == 2 {
+                self.ops
+                    .leaky(self.ops.conv1x1(x, &format!("{F}.resize_layers.2.0")))
             } else {
-                self.ops.leaky(self.ops.conv(
-                    x,
-                    &format!("{F}.resize_layers.{layer}.0"),
-                    if layer == 3 { 2 } else { 1 },
-                    0,
-                ))
+                self.ops
+                    .leaky(self.ops.conv(x, &format!("{F}.resize_layers.3.0"), 2, 0))
             };
             features.push(self.ops.leaky(self.ops.conv(
                 x,
@@ -454,19 +455,19 @@ impl Network {
         crate::progress::message(format!(
             "  [canonical] running multi-scale fusion ({n_lights} lights)..."
         ));
-        // Always use batch size 2 in fusion_pair so canonical and wavelet share the exact
-        // same autotuned conv2d/deconv shapes without re-tuning 32 conv layers twice.
-        let mut result = Vec::with_capacity(n_lights);
+        // Keep canonical fusion outputs at 256x256 (32 MiB/light instead of 128 MiB/light) across
+        // the CPU backing boundary, and upsample to 512x512 on the GPU right when wavelet fusion
+        // consumes them—cutting PCIe transfers and host staging memory by 4x.
+        let c_stride = 256 * 256 * 256;
+        let mut canonical_256 = Packed::empty(self.ops.dtype, n_lights * c_stride);
         for f in (0..n_lights).step_by(2) {
             let s1 = (f + 1).min(n_lights - 1);
             let pair = self.fusion_pair(&stages, f, s1);
-            let pair = self.ops.resize(pair, 512, true);
-            result.push(
-                self.ops
-                    .capture(pair.clone().slice([0..1, 0..256, 0..512, 0..512])),
-            );
             if f + 1 < n_lights {
-                result.push(self.ops.capture(pair.slice([1..2, 0..256, 0..512, 0..512])));
+                canonical_256.append(self.ops.capture(pair));
+            } else {
+                canonical_256
+                    .append(self.ops.capture(pair.slice([0..1, 0..256, 0..256, 0..256])));
             }
         }
         drop(stages);
@@ -492,6 +493,7 @@ impl Network {
         crate::progress::message(format!(
             "  [wavelet] running fusion, inverse Haar & Gaussian smoothing ({n_lights} lights)..."
         ));
+        let mut result = Vec::with_capacity(n_lights);
         for f in 0..n_lights {
             let b01 = self.fusion_pair(&stages, f * 4, f * 4 + 1);
             let b23 = self.fusion_pair(&stages, f * 4 + 2, f * 4 + 3);
@@ -501,11 +503,16 @@ impl Network {
                 b23.clone().slice([0..1, 0..256, 0..256, 0..256]),
                 b23.slice([1..2, 0..256, 0..256, 0..256]),
             ];
-            let canonical =
-                result[f].upload_range(0..result[f].len(), [1, 256, 512, 512], &self.ops.device);
+            let can_off = f * c_stride;
+            let canonical_small = canonical_256.upload_range(
+                can_off..can_off + c_stride,
+                [1, 256, 256, 256],
+                &self.ops.device,
+            );
+            let canonical = self.ops.resize(canonical_small, 512, true);
             let nhwc = self.smooth_nhwc_fast(bands, canonical);
             // Pixel-major host layout makes sample gathering contiguous across channels.
-            result[f] = self.ops.capture(nhwc);
+            result.push(self.ops.capture(nhwc));
         }
         result
     }

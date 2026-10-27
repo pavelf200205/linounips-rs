@@ -266,7 +266,10 @@ fn main() -> Result<()> {
             .to_string_lossy();
         let view_progress = progress::view(&view_name, view_index + 1, total_views);
         let start = Instant::now();
-        progress::message(format!("Loading and normalizing images from {}...", object.display()));
+        progress::message(format!(
+            "Loading and normalizing images from {}...",
+            object.display()
+        ));
         let input = Input::load(
             &object,
             images,
@@ -306,7 +309,11 @@ fn main() -> Result<()> {
                 .filter_map(|(i, v)| v.then_some(i))
                 .collect();
             if ids.is_empty() {
-                progress::message(format!("  Block {}/{}: skipped (0 foreground pixels)", block + 1, grid * grid));
+                progress::message(format!(
+                    "  Block {}/{}: skipped (0 foreground pixels)",
+                    block + 1,
+                    grid * grid
+                ));
                 continue;
             }
             let masked: Vec<_> = rgb.iter().map(|im| im.zero_masked_planar(&mask)).collect();
@@ -405,7 +412,12 @@ fn main() -> Result<()> {
             profile.push(serde_json::json!({"block":block,"encoder_seconds":encode_seconds,"seconds":elapsed,"foreground":ids.len()}));
         }
         let inference_seconds = inference.elapsed().as_secs_f64();
-        progress::message(format!("Saving {} output map(s) to {}...", maps.len(), dir.display()));
+        progress::message(format!("  Timings: {}", net.ops.timing_summary()));
+        progress::message(format!(
+            "Saving {} output map(s) to {}...",
+            maps.len(),
+            dir.display()
+        ));
         for map in &maps {
             output::save(map, &input, &dir, &formats)?;
         }

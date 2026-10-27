@@ -53,7 +53,7 @@ impl Ops {
         );
         let expected = crate::schema::expected(pbr);
         let mut raw_linear: HashMap<String, (usize, usize, Vec<f32>)> = HashMap::new();
-        let mut weights = HashMap::with_capacity(expected.len() + 16);
+        let mut weights = HashMap::with_capacity(expected.len() + 20);
         for (name, mut shape) in expected {
             let t = archive.tensor(&name).with_context(|| {
                 format!("Missing required tensor {name}; wrong checkpoint mode or architecture")
@@ -86,6 +86,34 @@ impl Ops {
                 _ => anyhow::bail!("Unsupported dtype for {name}"),
             };
             ensure!(v.iter().all(|v| v.is_finite()), "Nonfinite tensor {name}");
+            // Pre-pack 2x2 stride-2 ConvTranspose2d weights [c_in, c_out, 2, 2] into [c_out * 4, c_in]
+            // so deconv executes as a fast NCHW GEMM + 2x2 PixelShuffle.
+            if shape.len() == 4
+                && (name == "image_encoder.fusion.resize_layers.0.0.weight"
+                    || name == "image_encoder.fusion.resize_layers.0.2.weight"
+                    || name == "image_encoder.fusion.resize_layers.1.0.weight")
+            {
+                let (c_in, c_out) = (shape[0], shape[1]);
+                let mut gemm_w = vec![0.0f32; c_out * 4 * c_in];
+                for ic in 0..c_in {
+                    for oc in 0..c_out {
+                        for ky in 0..2 {
+                            for kx in 0..2 {
+                                let src_idx = ((ic * c_out + oc) * 2 + ky) * 2 + kx;
+                                let dst_row = (oc * 2 + ky) * 2 + kx;
+                                gemm_w[dst_row * c_in + ic] = v[src_idx];
+                            }
+                        }
+                    }
+                }
+                let n_gemm = gemm_w.len();
+                let gemm_t = upload(gemm_w, [n_gemm], &device, dtype);
+                let prefix = name.strip_suffix(".weight").unwrap();
+                weights.insert(
+                    format!("{prefix}.deconv_gemm"),
+                    (vec![1, c_out * 4, c_in], gemm_t),
+                );
+            }
             // Store linear weights in GEMM layout once, without a duplicate GPU copy.
             if shape.len() == 2 {
                 let (o, i) = (shape[0], shape[1]);
@@ -241,6 +269,26 @@ impl Ops {
         .cast(self.dtype)
     }
 
+    /// Execute a 1x1 pointwise convolution directly in NCHW layout via GEMM without
+    /// NCHW <-> NHWC transpose copies.
+    pub fn conv1x1(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
+        if self.reference_kernels {
+            return self.conv(x, p, 1, 0);
+        }
+        let _timer = self.span("conv");
+        let [b, c, h, w] = x.dims();
+        let weight: Tensor<4> = self.w(&format!("{p}.weight"));
+        let o = weight.dims()[0];
+        let out = weight.reshape([1, o, c]).matmul(x.reshape([b, c, h * w]));
+        let bias_key = format!("{p}.bias");
+        let out = if self.has(&bias_key) {
+            out + self.w::<1>(&bias_key).reshape([1, o, 1])
+        } else {
+            out
+        };
+        out.reshape([b, o, h, w])
+    }
+
     pub fn conv(&self, x: Tensor<4>, p: &str, stride: usize, pad: usize) -> Tensor<4> {
         let _timer = self.span("conv");
         let bias_key = format!("{p}.bias");
@@ -255,6 +303,21 @@ impl Ops {
 
     pub fn deconv(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
         let _timer = self.span("transpose_conv");
+        let gemm_key = format!("{p}.deconv_gemm");
+        if !self.reference_kernels && self.has(&gemm_key) {
+            let [b, c_in, h, w] = x.dims();
+            let weight: Tensor<3> = self.w(&gemm_key);
+            let c_out = weight.dims()[1] / 4;
+            let bias: Tensor<1> = self.w(&format!("{p}.bias"));
+            let y = weight
+                .matmul(x.reshape([b, c_in, h * w]))
+                .reshape([b, c_out, 4, h * w])
+                + bias.reshape([1, c_out, 1, 1]);
+            return y
+                .reshape([b, c_out, 2, 2, h, w])
+                .permute([0, 1, 4, 2, 5, 3])
+                .reshape([b, c_out, h * 2, w * 2]);
+        }
         module::conv_transpose2d(
             x,
             self.w(&format!("{p}.weight")),
@@ -727,6 +790,17 @@ impl Ops {
 
     pub fn reset_timings(&self) {
         self.timings.borrow_mut().clear();
+    }
+
+    pub fn timing_summary(&self) -> String {
+        let timings = self.timings.borrow();
+        let mut list: Vec<(&'static str, u64, f64)> =
+            timings.iter().map(|(&k, &(c, s))| (k, c, s)).collect();
+        list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        list.into_iter()
+            .map(|(k, c, s)| format!("{k}={s:.2}s({c})"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn timing_report(&self) -> serde_json::Value {
