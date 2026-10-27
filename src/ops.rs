@@ -12,6 +12,16 @@ use std::{
 };
 
 pub struct Ops {
+    pub gemm_convolutions: bool,
+    pub fused_resize_conv: bool,
+    pub flash_attention: bool,
+    pub wide_wavelet_fusion: bool,
+    pub conv_workspace_mib: usize,
+    pub conv_queue_depth: usize,
+    pub attention_query_chunk: usize,
+    pub mlp_chunk_tokens: usize,
+    pub pool_cache_mib: usize,
+    routes: RefCell<BTreeMap<&'static str, u64>>,
     pub device: Device,
     pub dtype: FloatDType,
     pub score_mib: usize,
@@ -213,6 +223,16 @@ impl Ops {
         }
 
         Ok(Self {
+            gemm_convolutions: false,
+            fused_resize_conv: false,
+            flash_attention: false,
+            wide_wavelet_fusion: false,
+            conv_workspace_mib: 16,
+            conv_queue_depth: 2,
+            attention_query_chunk: 512,
+            mlp_chunk_tokens: 0,
+            pool_cache_mib: 256,
+            routes: RefCell::new(BTreeMap::new()),
             device,
             dtype,
             score_mib,
@@ -334,6 +354,10 @@ impl Ops {
         let _detail = self
             .profile_sync
             .then(|| self.span(&format!("conv/{p}/{:?}/s{stride}", x.dims())));
+        if self.gemm_convolutions && !self.reference_kernels && crate::conv_gemm::supported(&x) {
+            let [_, _, h, w] = x.dims();
+            return self.conv_gemm(x, p, stride, pad, h, w, false);
+        }
         let bias_key = format!("{p}.bias");
         let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
         module::conv2d(
@@ -342,6 +366,112 @@ impl Ops {
             bias,
             ConvOptions::new([stride; 2], [pad; 2], [1; 2], 1),
         )
+    }
+
+    fn conv_gemm(
+        &self,
+        x: Tensor<4>,
+        p: &str,
+        stride: usize,
+        pad: usize,
+        h: usize,
+        w: usize,
+        upsample: bool,
+    ) -> Tensor<4> {
+        let _timer = self.span("experimental/conv_gemm");
+        *self
+            .routes
+            .borrow_mut()
+            .entry(if upsample {
+                "resize_conv_gemm"
+            } else {
+                "conv_gemm"
+            })
+            .or_default() += 1;
+        let [b, c, _, _] = x.dims();
+        let weight: Tensor<4> = self.w(&format!("{p}.weight"));
+        let [o, _, kh, kw] = weight.dims();
+        assert_eq!(kh, kw);
+        let reduction = c * kh * kw;
+        let oh = (h + 2 * pad - kh) / stride + 1;
+        let ow = (w + 2 * pad - kw) / stride + 1;
+        let hw = oh * ow;
+        let bytes = if self.dtype == FloatDType::F32 { 4 } else { 2 };
+        let limit = (self.conv_workspace_mib * 1024 * 1024 / (reduction * bytes))
+            .max(1)
+            .min(hw.next_power_of_two());
+        let rows = 1usize << limit.ilog2();
+        let weight = weight.reshape([1, o, reduction]);
+        let bias_key = format!("{p}.bias");
+        let bias = self
+            .has(&bias_key)
+            .then(|| self.w::<1>(&bias_key).reshape([1, o, 1]));
+        let mut output = Tensor::<3>::empty([b, o, hw], self.options());
+        let mut pending = 0;
+        for bi in 0..b {
+            for start in (0..hw).step_by(rows) {
+                let end = (start + rows).min(hw);
+                let packed = {
+                    let _timer = self.span("experimental/conv_pack");
+                    crate::conv_gemm::patches(
+                        x.clone(),
+                        h,
+                        w,
+                        kh,
+                        stride,
+                        pad,
+                        bi * hw + start,
+                        rows,
+                        upsample,
+                    )
+                };
+                let value = {
+                    let _timer = self.span("experimental/conv_matmul");
+                    let y = weight.clone().matmul(packed);
+                    if let Some(bias) = &bias {
+                        y + bias.clone()
+                    } else {
+                        y
+                    }
+                };
+                output = output.slice_assign(
+                    [bi..bi + 1, 0..o, start..end],
+                    value.slice([0..1, 0..o, 0..end - start]),
+                );
+                *self
+                    .routes
+                    .borrow_mut()
+                    .entry("conv_gemm_chunks")
+                    .or_default() += 1;
+                pending += 1;
+                if self.conv_queue_depth > 0 && pending >= self.conv_queue_depth {
+                    let _timer = self.span("experimental/conv_queue_wait");
+                    self.device.sync().expect("bounded convolution workspaces");
+                    pending = 0;
+                }
+            }
+        }
+        if self.conv_queue_depth > 0 && pending > 0 {
+            let _timer = self.span("experimental/conv_queue_wait");
+            self.device.sync().expect("convolution tail completion");
+        } else {
+            self.boundary();
+        }
+        output.reshape([b, o, oh, ow])
+    }
+
+    pub fn conv_upsampled(
+        &self,
+        x: Tensor<4>,
+        p: &str,
+        size: usize,
+        stride: usize,
+        pad: usize,
+    ) -> Tensor<4> {
+        if self.fused_resize_conv && !self.reference_kernels && crate::conv_gemm::supported(&x) {
+            return self.conv_gemm(x, p, stride, pad, size, size, true);
+        }
+        self.conv(self.resize(x, size, true), p, stride, pad)
     }
 
     pub fn deconv(&self, x: Tensor<4>, p: &str) -> Tensor<4> {
@@ -396,6 +526,23 @@ impl Ops {
         let _detail = self
             .profile_sync
             .then(|| self.span(&format!("attention/{b}x{h}x{n}x{m}x{d}/valid{valid_m}")));
+        if self.flash_attention && !self.reference_kernels && m > 64 {
+            if let Some(out) =
+                crate::flash_attention::forward(q.clone(), k.clone(), v.clone(), scale, valid_m)
+            {
+                *self
+                    .routes
+                    .borrow_mut()
+                    .entry("flash_attention")
+                    .or_default() += 1;
+                return out;
+            }
+            *self
+                .routes
+                .borrow_mut()
+                .entry("flash_backend_fallback")
+                .or_default() += 1;
+        }
         if !self.reference_kernels && m <= 64 && valid_m == m {
             if let Some(out) =
                 crate::fast_attention::forward(q.clone(), k.clone(), v.clone(), scale)
@@ -463,15 +610,8 @@ impl Ops {
             };
             let raw_qs = budget_bytes / (bs * pad_m.max(1) * elem_bytes);
             if raw_qs >= 64 {
-                let qs = if raw_qs >= 512 {
-                    512
-                } else if raw_qs >= 256 {
-                    256
-                } else if raw_qs >= 128 {
-                    128
-                } else {
-                    64
-                };
+                let limit = raw_qs.min(self.attention_query_chunk).max(64);
+                let qs = 1usize << limit.ilog2();
                 let pad_n = n.div_ceil(qs) * qs;
                 let q_pad = if pad_n > n {
                     let z = Tensor::<3>::zeros([bh, pad_n - n, d], self.options());
@@ -679,7 +819,7 @@ impl Ops {
                 .bytes_reserved
                 .saturating_sub(u.bytes_in_use)
                 .saturating_sub(u.bytes_padding);
-            if unused > 256 * 1024 * 1024 {
+            if self.pool_cache_mib > 0 && unused > self.pool_cache_mib * 1024 * 1024 {
                 self.device.sync().expect("allocator boundary");
                 self.device.memory_cleanup();
             }
@@ -887,6 +1027,7 @@ impl Ops {
         self.readback_bytes.set(0);
         self.readback_calls.set(0);
         self.pool_peak.set((0, 0));
+        self.routes.borrow_mut().clear();
     }
 
     fn sample_pool(&self) {
@@ -902,6 +1043,10 @@ impl Ops {
     pub fn memory_report(&self) -> serde_json::Value {
         let (reserved, used) = self.pool_peak.get();
         serde_json::json!({"feature_readback_bytes": self.readback_bytes.get(), "feature_readback_calls": self.readback_calls.get(), "sampled_pool_reserved_peak_bytes": reserved, "sampled_pool_in_use_peak_bytes": used, "sampling": "readback boundaries; also span boundaries with --profile-sync; not a device VRAM high-water mark"})
+    }
+
+    pub fn experiment_report(&self) -> serde_json::Value {
+        serde_json::json!({"gemm_convolutions":self.gemm_convolutions,"fused_resize_conv":self.fused_resize_conv,"flash_attention":self.flash_attention,"wide_wavelet_fusion":self.wide_wavelet_fusion,"conv_workspace_mib":self.conv_workspace_mib,"conv_queue_depth":self.conv_queue_depth,"attention_query_chunk":self.attention_query_chunk,"mlp_chunk_tokens":self.mlp_chunk_tokens,"pool_cache_mib":self.pool_cache_mib,"routes":*self.routes.borrow()})
     }
 
     pub fn timing_summary(&self) -> String {

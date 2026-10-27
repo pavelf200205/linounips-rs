@@ -5,6 +5,13 @@ based on upstream revision 4ddb4113d0196b853978d2cc72de582611b01ebd.
 
 ## Current memory/performance pass
 
+Experimental follow-up: use `--experimental-fast` to try bounded GEMM
+convolutions, fused resize/convolution packing and direct FlashAttention.
+These routes are opt-in because changing reductions can change floating-point
+rounding. No lower-resolution inputs, missing lights or shorter attention context
+are used. See [EXPERIMENTS.md](EXPERIMENTS.md) for isolated switches and the manual
+benchmark matrix. This revision has not been built or run on a GPU by the agent.
+
 See [PERFORMANCE.md](PERFORMANCE.md) for the current implementation, exact-output
 comparison procedure and timing interpretation. This pass retains arithmetic,
 precision, attention algorithms and pixel grouping; it changes feature storage,

@@ -55,6 +55,11 @@ impl Network {
             .reshape([1, 1, c]);
         let step = ((self.ops.inflight_mib * 1024 * 1024 / (b.max(1) * c * 16)) / 512 * 512)
             .clamp(512, 4096);
+        let step = if self.ops.mlp_chunk_tokens > 0 {
+            (self.ops.mlp_chunk_tokens / 512 * 512).max(512)
+        } else {
+            step
+        };
         if n <= step {
             let y = self.ops.norm(x.clone(), &format!("{p}.norm2"), eps);
             let y = activation::gelu(self.ops.linear(y, &format!("{p}.mlp.fc1")));
@@ -352,18 +357,28 @@ impl Network {
     }
 
     fn fusion_pair(&self, stages: &[Packed], s0: usize, s1: usize) -> Tensor<4> {
+        self.fusion_streams(stages, &[s0, s1])
+    }
+
+    fn fusion_streams(&self, stages: &[Packed], streams: &[usize]) -> Tensor<4> {
         let _timer = self.ops.span("fusion");
+        let batch = streams.len();
         let stride = 384 * 64 * 64;
         let mut features = Vec::with_capacity(4);
         for (layer, data) in stages.iter().enumerate() {
-            let x = if s1 == s0 + 1 {
-                let off = s0 * stride;
-                data.upload_range(off..off + 2 * stride, [2, 384, 64, 64], &self.ops.device)
+            let x = if streams.windows(2).all(|s| s[1] == s[0] + 1) {
+                let off = streams[0] * stride;
+                data.upload_range(
+                    off..off + batch * stride,
+                    [batch, 384, 64, 64],
+                    &self.ops.device,
+                )
             } else {
-                let mut pair = Packed::empty(self.ops.dtype, 2 * stride);
-                pair.extend_range(data, s0 * stride..(s0 + 1) * stride);
-                pair.extend_range(data, s1 * stride..(s1 + 1) * stride);
-                pair.into_tensor([2, 384, 64, 64], &self.ops.device)
+                let mut packed = Packed::empty(self.ops.dtype, batch * stride);
+                for &stream in streams {
+                    packed.extend_range(data, stream * stride..(stream + 1) * stride);
+                }
+                packed.into_tensor([batch, 384, 64, 64], &self.ops.device)
             };
             let x = self
                 .ops
@@ -400,8 +415,14 @@ impl Network {
         let x = self.refine(l4, None, 4, 64);
         let x = self.refine(x, Some(l3), 3, 128);
         let x = self.refine(x, Some(l2), 2, 256);
-        let x = self.refine(x, Some(l1), 1, 512);
-        let x = self.ops.conv(x, &format!("{F}.scratch.output_conv1"), 2, 1);
+        let x = if self.ops.fused_resize_conv {
+            let x = self.refine(x, Some(l1), 1, 256);
+            self.ops
+                .conv_upsampled(x, &format!("{F}.scratch.output_conv1"), 512, 2, 1)
+        } else {
+            let x = self.refine(x, Some(l1), 1, 512);
+            self.ops.conv(x, &format!("{F}.scratch.output_conv1"), 2, 1)
+        };
         self.ops.position(x)
     }
 
@@ -562,8 +583,18 @@ impl Network {
         });
         for f in 0..n_lights {
             let _light_timer = self.ops.span("wavelet/fusion_smooth_and_readback");
-            let b01 = self.fusion_pair(&stages, f * 4, f * 4 + 1);
-            let b23 = self.fusion_pair(&stages, f * 4 + 2, f * 4 + 3);
+            let (b01, b23) = if self.ops.wide_wavelet_fusion {
+                let all = self.fusion_streams(&stages, &[f * 4, f * 4 + 1, f * 4 + 2, f * 4 + 3]);
+                (
+                    all.clone().slice([0..2, 0..256, 0..256, 0..256]),
+                    all.slice([2..4, 0..256, 0..256, 0..256]),
+                )
+            } else {
+                (
+                    self.fusion_pair(&stages, f * 4, f * 4 + 1),
+                    self.fusion_pair(&stages, f * 4 + 2, f * 4 + 3),
+                )
+            };
             let can_off = f * c_stride;
             let canonical_small = canonical_256.upload_range(
                 can_off..can_off + c_stride,

@@ -1,5 +1,9 @@
 # Memory and exact-output performance pass
 
+The later opt-in experiments are documented in [EXPERIMENTS.md](EXPERIMENTS.md).
+The exact-output contract below describes the default memory path; alternative
+GEMM/flash routes require separate equality validation.
+
 ## Contract
 
 Target: reduce the saved ~93–97 second inference time without changing output
@@ -52,7 +56,7 @@ measurement; fewer live buffers do not guarantee immediate driver reclamation.
 Convolution-to-GEMM, FlashAttention, resize/convolution fusion, new activation
 fusions, shorter Gaussian support, quantization, changed batch/context sizes,
 different checkpoints and altered autotune/cache policy can change reduction
-order, intermediate rounding or selected kernels. They are not part of this pass.
+order, intermediate rounding or selected kernels. They are not enabled by default.
 The earlier analysis suggested some of these before bitwise equality was required.
 
 ## Reporting

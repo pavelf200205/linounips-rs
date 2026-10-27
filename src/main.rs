@@ -1,5 +1,7 @@
+mod conv_gemm;
 mod fast_attention;
 mod fast_norm;
+mod flash_attention;
 mod geometry;
 mod host;
 mod input;
@@ -58,6 +60,35 @@ struct Cli {
     /// Synchronize timed operations for diagnosis; perturbs throughput.
     #[arg(long, global = true)]
     profile_sync: bool,
+    /// Enable GEMM convolution, fused resize/convolution, and flash attention experiments.
+    #[arg(long, global = true)]
+    experimental_fast: bool,
+    #[arg(long, global = true)]
+    gemm_convolutions: bool,
+    #[arg(long, global = true)]
+    fused_resize_conv: bool,
+    #[arg(long, global = true)]
+    flash_attention: bool,
+    /// Exclude flash from the experimental preset.
+    #[arg(long, global = true, conflicts_with = "flash_attention")]
+    no_experimental_flash: bool,
+    /// Fuse all four wavelet streams together (higher live activation memory).
+    #[arg(long, global = true)]
+    wide_wavelet_fusion: bool,
+    /// Per-chunk packed convolution workspace, not total VRAM.
+    #[arg(long, global = true, default_value_t = 16)]
+    conv_workspace_mib: usize,
+    /// Complete this many convolution chunks at a time; 0 permits unbounded queueing.
+    #[arg(long, global = true, default_value_t = 2)]
+    conv_queue_depth: usize,
+    #[arg(long, global = true, default_value_t = 512)]
+    attention_query_chunk: usize,
+    /// Override MLP chunk size, rounded to multiples of 512; 0 keeps existing budget logic.
+    #[arg(long, global = true, default_value_t = 0)]
+    mlp_chunk_tokens: usize,
+    /// Unused allocator reservation cleanup threshold; 0 retains cached allocations.
+    #[arg(long, global = true, default_value_t = 256)]
+    pool_cache_mib: usize,
     /// Print detailed block timings and write profile.json (wall-clock timings, not device timestamps).
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
@@ -142,6 +173,14 @@ fn main() -> Result<()> {
             && cli.score_budget_mib > 0
             && cli.score_budget_mib <= 16384,
         "Batch sizes and memory budget must be positive (budget <=16384 MiB)"
+    );
+    ensure!(
+        (1..=1024).contains(&cli.conv_workspace_mib)
+            && (64..=16384).contains(&cli.attention_query_chunk)
+            && cli.mlp_chunk_tokens <= 65536
+            && cli.pool_cache_mib <= 65536
+            && cli.conv_queue_depth <= 64,
+        "Experimental settings out of range (workspace 1..1024 MiB; query chunk 64..16384; MLP <=65536; queue <=64)"
     );
     use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
     let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
@@ -259,6 +298,16 @@ fn main() -> Result<()> {
     ops.inflight_mib = cli.inflight_mib;
     ops.memory_optimizations = !cli.legacy_memory_path;
     ops.profile_sync = cli.profile_sync;
+    ops.gemm_convolutions = cli.experimental_fast || cli.gemm_convolutions;
+    ops.fused_resize_conv = cli.experimental_fast || cli.fused_resize_conv;
+    ops.flash_attention =
+        (cli.experimental_fast || cli.flash_attention) && !cli.no_experimental_flash;
+    ops.wide_wavelet_fusion = cli.wide_wavelet_fusion;
+    ops.conv_workspace_mib = cli.conv_workspace_mib;
+    ops.conv_queue_depth = cli.conv_queue_depth;
+    ops.attention_query_chunk = cli.attention_query_chunk;
+    ops.mlp_chunk_tokens = cli.mlp_chunk_tokens;
+    ops.pool_cache_mib = cli.pool_cache_mib;
     let net = network::Network {
         ops,
         pbr,
@@ -491,6 +540,8 @@ fn main() -> Result<()> {
         metadata["memory_optimizations"] = serde_json::json!(!cli.legacy_memory_path);
         metadata["profile_sync"] = serde_json::json!(cli.profile_sync);
         metadata["memory"] = net.ops.memory_report();
+        metadata["experiments"] = net.ops.experiment_report();
+        metadata["experimental_flash_dispatch_totals"] = flash_attention::stats();
         metadata["blocks"] = serde_json::json!(profile);
         metadata["timing_kind"] = serde_json::json!(if cli.profile_sync {
             "synchronized inclusive CPU wall time; diagnostic mode changes execution; nested spans overlap"
