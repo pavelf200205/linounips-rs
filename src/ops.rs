@@ -1101,10 +1101,6 @@ impl Ops {
         x * cos + Tensor::cat(parts, 3) * sin
     }
 
-    pub fn rotary(&self, x: Tensor<4>, positions: &[[usize; 2]]) -> Tensor<4> {
-        self.rotary_cached(x, None, None, positions)
-    }
-
     pub fn capture<const D: usize>(&self, x: Tensor<D>) -> crate::host::Packed {
         let _timer = self.span("feature_readback");
         let bytes =

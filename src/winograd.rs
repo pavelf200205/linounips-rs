@@ -151,14 +151,11 @@ fn inverse_output<F: Float>(
                 let yy = ty * 2usize + r;
                 let xx = tx * 2usize + cc;
                 if batch < out.shape(0) && yy < h && xx < w {
-                    let mut value = f32::new(0.0_f32);
-                    if cc == 0usize {
-                        value = t[r * 4usize] + t[r * 4usize + 1usize] + t[r * 4usize + 2usize];
+                    let value = if cc == 0usize {
+                        t[r * 4usize] + t[r * 4usize + 1usize] + t[r * 4usize + 2usize]
                     } else {
-                        value = t[r * 4usize + 1usize]
-                            - t[r * 4usize + 2usize]
-                            - t[r * 4usize + 3usize];
-                    }
+                        t[r * 4usize + 1usize] - t[r * 4usize + 2usize] - t[r * 4usize + 3usize]
+                    };
                     let mut native = F::cast_from(value);
                     if has_bias {
                         native += bias[ch];

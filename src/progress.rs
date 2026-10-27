@@ -59,18 +59,6 @@ impl Drop for View {
     }
 }
 
-pub struct Phase;
-
-#[inline]
-pub fn phase(_label: impl Into<String>, _total: usize, _unit: &'static str) -> Phase {
-    Phase
-}
-
-impl Phase {
-    #[inline]
-    pub fn set(&self, _done: usize) {}
-}
-
 pub fn message(text: String) {
     if ENABLED.load(Ordering::Relaxed) {
         let _ = writeln!(io::stderr().lock(), "{text}");

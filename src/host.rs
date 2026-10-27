@@ -25,35 +25,11 @@ impl Packed {
         }
     }
 
-    pub fn zeros(dtype: FloatDType, len: usize) -> Self {
-        match dtype {
-            FloatDType::F16 => Self::F16(vec![half::f16::ZERO; len]),
-            FloatDType::BF16 => Self::BF16(vec![half::bf16::ZERO; len]),
-            _ => Self::F32(vec![0.0; len]),
-        }
-    }
-
-    pub fn get(&self, i: usize) -> f32 {
-        match self {
-            Self::F16(v) => v[i].to_f32(),
-            Self::BF16(v) => v[i].to_f32(),
-            Self::F32(v) => v[i],
-        }
-    }
-
     pub fn len(&self) -> usize {
         match self {
             Self::F16(v) => v.len(),
             Self::BF16(v) => v.len(),
             Self::F32(v) => v.len(),
-        }
-    }
-
-    pub fn range(&self, r: std::ops::Range<usize>) -> Vec<f32> {
-        match self {
-            Self::F16(v) => v[r].iter().copied().map(half::f16::to_f32).collect(),
-            Self::BF16(v) => v[r].iter().copied().map(half::bf16::to_f32).collect(),
-            Self::F32(v) => v[r].to_vec(),
         }
     }
 
