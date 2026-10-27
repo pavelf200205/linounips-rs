@@ -186,8 +186,8 @@ fn online_short_plane<F: Float>(
             for j in 0..slots {
                 let ch = lane + j * plane;
                 if valid && ch < width {
-                    acc[j] = acc[j] * correction
-                        + probability * f32::cast_from(v[v_row + ch * v_s3]);
+                    acc[j] =
+                        acc[j] * correction + probability * f32::cast_from(v[v_row + ch * v_s3]);
                 }
             }
             maximum = next;
@@ -268,6 +268,7 @@ struct SoftmaxOp {
     desc: CustomOpIr,
     scale: f32,
     valid_m: u32,
+    reuse: bool,
 }
 impl Operation<FusionCubeRuntime> for SoftmaxOp {
     fn execute(
@@ -276,7 +277,7 @@ impl Operation<FusionCubeRuntime> for SoftmaxOp {
     ) -> Result<(), ExecutionError> {
         let ([scores], [out]) = self.desc.as_fixed();
         let scores = handles.get_float_tensor::<CubeBackend>(scores);
-        let [bb, qq, _] = scores.meta.shape().dims::<3>();
+        let [bb, qq, mm] = scores.meta.shape().dims::<3>();
         let rows = bb * qq;
         let client = scores.client.clone();
         let props = client.properties();
@@ -303,12 +304,18 @@ impl Operation<FusionCubeRuntime> for SoftmaxOp {
         }
         let count = CubeCount::Static(gx as u32, gy as u32, 1);
         let dim = CubeDim::new_1d(128);
-        let result = empty_device_contiguous_dtype(
-            client.clone(),
-            scores.device.clone(),
-            scores.meta.shape().clone(),
-            scores.dtype,
-        );
+        // Each row finishes its reductions before writing; no other row reads it.
+        let reuse = self.reuse && scores.can_mut() && **scores.meta.strides() == [qq * mm, mm, 1];
+        let result = if reuse {
+            scores.clone()
+        } else {
+            empty_device_contiguous_dtype(
+                client.clone(),
+                scores.device.clone(),
+                scores.meta.shape().clone(),
+                scores.dtype,
+            )
+        };
         macro_rules! launch {
             ($ty:ty) => {{
                 if plane {
@@ -437,7 +444,12 @@ impl Operation<FusionCubeRuntime> for ShortAttentionOp {
 
 /// Fused subgroup scale + masked softmax on a 3D score tensor `[B, Q, M]`.
 /// Columns `>= valid_m` are excluded from the softmax statistics and written as `0.0`.
-pub fn scale_softmax(scores: BurnTensor<3>, scale: f64, valid_m: usize) -> Option<BurnTensor<3>> {
+pub fn scale_softmax(
+    scores: BurnTensor<3>,
+    scale: f64,
+    valid_m: usize,
+    reuse: bool,
+) -> Option<BurnTensor<3>> {
     let scale_f32 = scale as f32;
     let s = scores.inner().try_into_primitive::<Gpu>().ok()?;
     let client = s.client.clone();
@@ -449,6 +461,7 @@ pub fn scale_softmax(scores: BurnTensor<3>, scale: f64, valid_m: usize) -> Optio
         vec![
             ScalarIr::UInt(scale_f32.to_bits() as u64),
             ScalarIr::UInt(valid_m as u64),
+            ScalarIr::UInt(reuse as u64),
         ],
     );
     let [out] = client
@@ -459,6 +472,7 @@ pub fn scale_softmax(scores: BurnTensor<3>, scale: f64, valid_m: usize) -> Optio
                 desc,
                 scale: scale_f32,
                 valid_m: valid_m as u32,
+                reuse,
             },
         )
         .outputs();
@@ -526,5 +540,5 @@ fn record(index: usize) {
     }
 }
 pub fn stats() -> serde_json::Value {
-    serde_json::json!({"accelerated":COUNTS[0].load(Ordering::Relaxed),"unit_flash":COUNTS[1].load(Ordering::Relaxed),"subgroup_streaming":COUNTS[2].load(Ordering::Relaxed),"scalar_streaming":COUNTS[3].load(Ordering::Relaxed)})
+    serde_json::json!({"gemm_subgroup_softmax":COUNTS[0].load(Ordering::Relaxed),"gemm_scalar_softmax":COUNTS[1].load(Ordering::Relaxed),"subgroup_streaming":COUNTS[2].load(Ordering::Relaxed),"scalar_streaming":COUNTS[3].load(Ordering::Relaxed)})
 }

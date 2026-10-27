@@ -52,6 +52,12 @@ struct Cli {
     /// Use the tensor-operation fallbacks for attention, geometry and LayerNorm.
     #[arg(long, global = true)]
     reference_kernels: bool,
+    /// Restore previous feature storage, Gaussian writes and intermediate allocations for A/B validation.
+    #[arg(long, global = true)]
+    legacy_memory_path: bool,
+    /// Synchronize timed operations for diagnosis; perturbs throughput.
+    #[arg(long, global = true)]
+    profile_sync: bool,
     /// Print detailed block timings and write profile.json (wall-clock timings, not device timestamps).
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
@@ -61,6 +67,13 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Compare decoded EXR/PNG outputs exactly, without initializing a GPU.
+    Compare {
+        #[arg(long)]
+        reference: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+    },
     Infer {
         /// .safetensors, or .pth converted with the bundled Python checkpoint exporter.
         #[arg(long)]
@@ -108,8 +121,16 @@ fn convert(input: &Path, out: &Path, python: &str) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
+    let process_start = Instant::now();
     let cli = Cli::parse();
     progress::configure(!cli.no_progress);
+    if let Command::Compare {
+        reference,
+        candidate,
+    } = &cli.command
+    {
+        return output::compare(reference, candidate);
+    }
     if let Command::Convert { model, out, python } = &cli.command {
         return convert(model, out, python);
     }
@@ -232,15 +253,20 @@ fn main() -> Result<()> {
         model.clone()
     };
     let pbr = matches!(mode, Mode::Pbr);
+    let model_load_start = Instant::now();
     let mut ops = ops::Ops::load(&checkpoint, device, dtype, cli.score_budget_mib, pbr)?;
     ops.reference_kernels = cli.reference_kernels;
     ops.inflight_mib = cli.inflight_mib;
+    ops.memory_optimizations = !cli.legacy_memory_path;
+    ops.profile_sync = cli.profile_sync;
     let net = network::Network {
         ops,
         pbr,
         encoder_batch: cli.encoder_batch,
         verbose: cli.verbose,
     };
+    let model_load_seconds = model_load_start.elapsed().as_secs_f64();
+    let startup_seconds = process_start.elapsed().as_secs_f64();
     let mut objects = if batch {
         std::fs::read_dir(&data)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -281,6 +307,7 @@ fn main() -> Result<()> {
         )?;
         let input_seconds = start.elapsed().as_secs_f64();
         net.ops.reset_timings();
+        let attention_before = fast_attention::stats();
         let inference = Instant::now();
         let n = input.images.len();
         let grid = input.size / 512;
@@ -317,7 +344,15 @@ fn main() -> Result<()> {
                 continue;
             }
             let masked: Vec<_> = rgb.iter().map(|im| im.zero_masked_planar(&mask)).collect();
-            let features = net.encode(&masked);
+            let compact = !cli.legacy_memory_path && ids.len() < 512 * 512;
+            let feature_rows = compact.then(|| {
+                let mut rows = vec![usize::MAX; 512 * 512];
+                for (row, &pixel) in ids.iter().enumerate() {
+                    rows[pixel] = row;
+                }
+                rows
+            });
+            let features = net.encode(&masked, &ids);
             drop(masked);
             let rgb_pixel_major: Vec<_> = rgb
                 .iter()
@@ -345,9 +380,16 @@ fn main() -> Result<()> {
                 if count == 0 {
                     continue;
                 }
-                let (colors, f) = prefetched
-                    .take()
-                    .unwrap_or_else(|| gather_samples(&rgb_pixel_major, &features, set, dtype));
+                let (colors, f) = prefetched.take().unwrap_or_else(|| {
+                    let _timer = net.ops.span("decoder/host_gather");
+                    gather_samples(
+                        &rgb_pixel_major,
+                        &features,
+                        set,
+                        feature_rows.as_deref(),
+                        dtype,
+                    )
+                });
                 let predictions = net.decode(
                     colors.into_tensor([count, n, 3], &net.ops.device),
                     f.into_tensor([count, n, 256], &net.ops.device),
@@ -358,17 +400,22 @@ fn main() -> Result<()> {
                 if group + 1 < groups {
                     let next_count = base + usize::from(group + 1 < extra);
                     if next_count > 0 {
+                        let _timer = net.ops.span("decoder/host_gather");
                         prefetched = Some(gather_samples(
                             &rgb_pixel_major,
                             &features,
                             &ids[at..at + next_count],
+                            feature_rows.as_deref(),
                             dtype,
                         ));
                     }
                 }
                 if predictions.len() == 1 {
                     let (name, tensor) = predictions.into_iter().next().unwrap();
-                    let values = read(tensor);
+                    let values = {
+                        let _timer = net.ops.span("decoder/output_readback");
+                        read(tensor)
+                    };
                     let map = maps.iter_mut().find(|m| m.name == name).unwrap();
                     let ch = map.channels;
                     for (i, &pixel) in set.iter().enumerate() {
@@ -384,7 +431,10 @@ fn main() -> Result<()> {
                         .collect();
                     let total_ch: usize = meta.iter().map(|(_, c)| *c).sum();
                     let tensors: Vec<_> = predictions.into_iter().map(|(_, t)| t).collect();
-                    let combined = read(Tensor::cat(tensors, 2));
+                    let combined = {
+                        let _timer = net.ops.span("decoder/output_readback");
+                        read(Tensor::cat(tensors, 2))
+                    };
                     let mut ch_offset = 0;
                     for (name, ch) in meta {
                         let map = maps.iter_mut().find(|m| m.name == name).unwrap();
@@ -422,6 +472,31 @@ fn main() -> Result<()> {
             output::save(map, &input, &dir, &formats)?;
         }
         let metadata = serde_json::json!({"revision":env!("LINO_REVISION"),"upstream":"4ddb4113d0196b853978d2cc72de582611b01ebd","model":model,"mode":format!("{mode:?}"),"precision":format!("{dtype:?}"),"device":format!("{:?}",net.ops.device.identity()),"images":n,"size":input.size,"files":input.files,"roi":input.roi,"normalization":normalization,"seed":seed,"pixel_batch":cli.pixel_batch,"encoder_batch":cli.encoder_batch,"score_budget_mib":cli.score_budget_mib,"inflight_mib":cli.inflight_mib,"reference_kernels":cli.reference_kernels,"attention_dispatch_totals":fast_attention::stats(),"operation_timings":net.ops.timing_report(),"input_seconds":input_seconds,"inference_seconds":inference_seconds,"seconds":start.elapsed().as_secs_f64(),"material_mapping":"clamp(raw,-1,1)*0.5+0.5; diffuse is upstream baseColor","normal_axes":"upstream xyz","formats":formats});
+        let mut metadata = metadata;
+        metadata["profile_schema_version"] = serde_json::json!(2);
+        metadata["model_load_seconds"] = serde_json::json!(model_load_seconds);
+        metadata["startup_seconds"] = serde_json::json!(startup_seconds);
+        metadata["process_elapsed_seconds"] =
+            serde_json::json!(process_start.elapsed().as_secs_f64());
+        let mut dispatch_view = fast_attention::stats();
+        for (name, value) in dispatch_view.as_object_mut().unwrap() {
+            *value = serde_json::json!(
+                value
+                    .as_u64()
+                    .unwrap()
+                    .saturating_sub(attention_before[name].as_u64().unwrap())
+            );
+        }
+        metadata["attention_dispatch_view"] = dispatch_view;
+        metadata["memory_optimizations"] = serde_json::json!(!cli.legacy_memory_path);
+        metadata["profile_sync"] = serde_json::json!(cli.profile_sync);
+        metadata["memory"] = net.ops.memory_report();
+        metadata["blocks"] = serde_json::json!(profile);
+        metadata["timing_kind"] = serde_json::json!(if cli.profile_sync {
+            "synchronized inclusive CPU wall time; diagnostic mode changes execution; nested spans overlap"
+        } else {
+            "asynchronous inclusive CPU wall time; readbacks include queued GPU work; nested spans overlap"
+        });
         std::fs::write(
             dir.join("metadata.json"),
             serde_json::to_vec_pretty(&metadata)?,
@@ -430,7 +505,7 @@ fn main() -> Result<()> {
             std::fs::write(
                 dir.join("profile.json"),
                 serde_json::to_vec_pretty(
-                    &serde_json::json!({"blocks":profile,"operations":net.ops.timing_report(),"timing_kind":"inclusive CPU wall time, includes waits when encountered; nested entries overlap"}),
+                    &serde_json::json!({"blocks":profile,"operations":net.ops.timing_report(),"profile_sync":cli.profile_sync,"memory":net.ops.memory_report(),"timing_kind":metadata["timing_kind"]}),
                 )?,
             )?;
         }

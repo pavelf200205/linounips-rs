@@ -153,6 +153,7 @@ struct NormOp {
     desc: CustomOpIr,
     epsilon: f32,
     ndims: usize,
+    reuse: bool,
 }
 impl Operation<FusionCubeRuntime> for NormOp {
     fn execute(
@@ -181,12 +182,25 @@ impl Operation<FusionCubeRuntime> for NormOp {
         }
         let count = CubeCount::Static(gx as u32, gy as u32, 1);
         let dim = CubeDim::new_1d(128);
-        let result = empty_device_contiguous_dtype(
-            client.clone(),
-            x.device.clone(),
-            x.meta.shape().clone(),
-            x.dtype,
-        );
+        let contiguous = if self.ndims == 4 {
+            let [_, b, n, c] = x.meta.shape().dims::<4>();
+            **x.meta.strides() == [b * n * c, n * c, c, 1]
+        } else {
+            let [_, n, c] = x.meta.shape().dims::<3>();
+            **x.meta.strides() == [n * c, c, 1]
+        };
+        // Both kernels load their complete row into registers before writing.
+        // Ownership is essential: residual tensors must never be overwritten.
+        let result = if self.reuse && contiguous && x.can_mut() {
+            x.clone()
+        } else {
+            empty_device_contiguous_dtype(
+                client.clone(),
+                x.device.clone(),
+                x.meta.shape().clone(),
+                x.dtype,
+            )
+        };
         macro_rules! launch {
             ($ty:ty) => {
                 if self.ndims == 4 {
@@ -238,6 +252,7 @@ pub fn forward<const D: usize>(
     gamma: BurnTensor<1>,
     beta: BurnTensor<1>,
     epsilon: f64,
+    reuse: bool,
 ) -> Option<BurnTensor<D>> {
     let shape = x.dims();
     let c = shape[D - 1];
@@ -272,12 +287,19 @@ pub fn forward<const D: usize>(
     {
         return None;
     }
-    let out = TensorIr::uninit(client.create_empty_handle(), x_prim.shape.clone(), x_prim.dtype);
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        x_prim.shape.clone(),
+        x_prim.dtype,
+    );
     let desc = CustomOpIr::with_scalars(
         "lino_subgroup_norm_v1",
         &[x_prim.into_ir(), gamma.into_ir(), beta.into_ir()],
         &[out],
-        vec![ScalarIr::UInt((epsilon as f32).to_bits() as u64)],
+        vec![
+            ScalarIr::UInt((epsilon as f32).to_bits() as u64),
+            ScalarIr::UInt(reuse as u64),
+        ],
     );
     let [out] = client
         .register(
@@ -287,6 +309,7 @@ pub fn forward<const D: usize>(
                 desc,
                 epsilon: epsilon as f32,
                 ndims,
+                reuse,
             },
         )
         .outputs();

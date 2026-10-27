@@ -233,6 +233,46 @@ fn gaussian_h<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F
     }
 }
 
+// Reuse the horizontal halo in shared memory. Keep the original boundary tests,
+// FP32 products and accumulation order (including skipped taps at image edges).
+#[cube(launch)]
+fn gaussian_h_tiled<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F>) {
+    let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+    let unit = usize::cast_from(UNIT_POS);
+    let mut tile = Shared::<[F]>::new_slice(276usize);
+    if group * 256usize < out.len() {
+        let start = group * 256usize;
+        let x_base = start % 512usize;
+        let row_base = start - x_base;
+        let shifted = x_base + unit;
+        tile[unit] = F::cast_from(0.0_f32);
+        if shifted >= 10usize && shifted < 522usize {
+            tile[unit] = x[row_base + shifted - 10usize];
+        }
+        if unit < 20usize {
+            let shifted = x_base + unit + 256usize;
+            tile[unit + 256usize] = F::cast_from(0.0_f32);
+            if shifted >= 10usize && shifted < 522usize {
+                tile[unit + 256usize] = x[row_base + shifted - 10usize];
+            }
+        }
+        sync_cube();
+        let ox = x_base + unit;
+        let mut sum = f32::new(0.0_f32);
+        #[unroll]
+        for k in 0..21usize {
+            let shifted = ox + k;
+            if shifted >= 10usize {
+                let ix = shifted - 10usize;
+                if ix < 512usize {
+                    sum += f32::cast_from(tile[unit + k]) * weights[k];
+                }
+            }
+        }
+        out[start + unit] = F::cast_from(sum);
+    }
+}
+
 /// Coalesced vertical 21-tap Gaussian pass: threads in a warp index consecutive `ox` (`0..31`)
 /// at the same `(ch, oy)` so all 21 reads hit a single contiguous L1 cache line per tap.
 #[cube(launch)]
@@ -259,6 +299,98 @@ fn gaussian_v_nhwc<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Ten
     }
 }
 
+// Same 21 products, accumulation order and final cast as gaussian_v_nhwc.
+// A 32-channel x 32-pixel tile transposes only the already-rounded results.
+// Neighboring lanes read adjacent X positions and then write adjacent channels.
+#[cube(launch)]
+fn gaussian_v_tiled<F: Float>(x: &Tensor<F>, weights: &Tensor<f32>, out: &mut Tensor<F>) {
+    let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+    let unit = usize::cast_from(UNIT_POS);
+    let mut tile = Shared::<[F]>::new_slice(1056usize);
+    if group < 65536usize {
+        let x_base = (group % 16usize) * 32usize;
+        let oy = (group / 16usize) % 512usize;
+        let c_base = (group / 8192usize) * 32usize;
+        for part in 0..4usize {
+            let local = unit + part * 256usize;
+            let xx = local % 32usize;
+            let cc = local / 32usize;
+            let col_base = (c_base + cc) * 262144usize + x_base + xx;
+            let mut sum = f32::new(0.0_f32);
+            #[unroll]
+            for k in 0..21usize {
+                let shifted = oy + k;
+                if shifted >= 10usize {
+                    let iy = shifted - 10usize;
+                    if iy < 512usize {
+                        sum += f32::cast_from(x[col_base + iy * 512usize]) * weights[k];
+                    }
+                }
+            }
+            tile[cc * 33usize + xx] = F::cast_from(sum);
+        }
+        sync_cube();
+        for part in 0..4usize {
+            let local = unit + part * 256usize;
+            let cc = local % 32usize;
+            let xx = local / 32usize;
+            let dst = (oy * 512usize + x_base + xx) * 256usize + c_base + cc;
+            out[dst] = tile[cc * 33usize + xx];
+        }
+    }
+}
+
+// Only the final vertical pass is sparse. Horizontal filtering and all upstream
+// spatial dependencies remain dense. Indices are exact FP32 integers < 262144.
+#[cube(launch)]
+fn gaussian_v_foreground<F: Float>(
+    x: &Tensor<F>,
+    weights: &Tensor<f32>,
+    pixels: &Tensor<f32>,
+    out: &mut Tensor<F>,
+) {
+    let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+    let unit = usize::cast_from(UNIT_POS);
+    let pixel_tiles = (pixels.len() + 31usize) / 32usize;
+    let mut tile = Shared::<[F]>::new_slice(1056usize);
+    if group < pixel_tiles * 8usize {
+        let pixel_base = (group % pixel_tiles) * 32usize;
+        let c_base = (group / pixel_tiles) * 32usize;
+        for part in 0..4usize {
+            let local = unit + part * 256usize;
+            let xx = local % 32usize;
+            let cc = local / 32usize;
+            if pixel_base + xx < pixels.len() {
+                let pixel = usize::cast_from(pixels[pixel_base + xx]);
+                let ox = pixel % 512usize;
+                let oy = pixel / 512usize;
+                let col_base = (c_base + cc) * 262144usize + ox;
+                let mut sum = f32::new(0.0_f32);
+                #[unroll]
+                for k in 0..21usize {
+                    let shifted = oy + k;
+                    if shifted >= 10usize {
+                        let iy = shifted - 10usize;
+                        if iy < 512usize {
+                            sum += f32::cast_from(x[col_base + iy * 512usize]) * weights[k];
+                        }
+                    }
+                }
+                tile[cc * 33usize + xx] = F::cast_from(sum);
+            }
+        }
+        sync_cube();
+        for part in 0..4usize {
+            let local = unit + part * 256usize;
+            let cc = local % 32usize;
+            let xx = local / 32usize;
+            if pixel_base + xx < pixels.len() {
+                out[(pixel_base + xx) * 256usize + c_base + cc] = tile[cc * 33usize + xx];
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct GeometryOp {
     desc: CustomOpIr,
@@ -273,15 +405,25 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
     ) -> Result<(), ExecutionError> {
         let x = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[0]);
         let client = x.client.clone();
-        let result = empty_device_contiguous_dtype(
-            client.clone(),
-            x.device.clone(),
-            Shape::new(self.shape),
-            x.dtype,
-        );
+        let [_, c, h, w] = x.meta.shape().dims::<4>();
+        let reuse = self.kind == 9 && x.can_mut() && **x.meta.strides() == [c * h * w, h * w, w, 1];
+        let result = if reuse {
+            x.clone()
+        } else {
+            empty_device_contiguous_dtype(
+                client.clone(),
+                x.device.clone(),
+                Shape::new(self.shape),
+                x.dtype,
+            )
+        };
         let rows = self.shape.iter().product::<usize>();
         let hw = &client.properties().hardware;
-        let groups = rows.div_ceil(256);
+        let groups = if self.kind == 7 {
+            self.shape[2].div_ceil(32) * 8
+        } else {
+            rows.div_ceil(if self.kind == 6 { 1024 } else { 256 })
+        };
         let gx = groups.min(hw.max_cube_count.0 as usize).max(1);
         let gy = groups.div_ceil(gx);
         if gy > hw.max_cube_count.1 as usize {
@@ -294,7 +436,7 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
         macro_rules! launch {
             ($ty:ty) => {{
                 match self.kind {
-                    0 => {
+                    0 | 9 => {
                         let lut = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
                         position::launch::<$ty>(
                             &client,
@@ -344,6 +486,41 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
                     4 => {
                         let weights = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
                         gaussian_h::launch::<$ty>(
+                            &client,
+                            count,
+                            dim,
+                            x.into_tensor_arg(),
+                            weights.into_tensor_arg(),
+                            result.clone().into_tensor_arg(),
+                        );
+                    }
+                    8 => {
+                        let weights = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        gaussian_h_tiled::launch::<$ty>(
+                            &client,
+                            count,
+                            dim,
+                            x.into_tensor_arg(),
+                            weights.into_tensor_arg(),
+                            result.clone().into_tensor_arg(),
+                        );
+                    }
+                    7 => {
+                        let weights = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        let pixels = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[2]);
+                        gaussian_v_foreground::launch::<$ty>(
+                            &client,
+                            count,
+                            dim,
+                            x.into_tensor_arg(),
+                            weights.into_tensor_arg(),
+                            pixels.into_tensor_arg(),
+                            result.clone().into_tensor_arg(),
+                        );
+                    }
+                    6 => {
+                        let weights = handles.get_float_tensor::<CubeBackend>(&self.desc.inputs[1]);
+                        gaussian_v_tiled::launch::<$ty>(
                             &client,
                             count,
                             dim,
@@ -418,9 +595,16 @@ fn register(
     Some(BurnTensor::from_primitive::<Gpu>(out))
 }
 
-pub fn add_position(x: BurnTensor<4>, lut: BurnTensor<1>) -> Option<BurnTensor<4>> {
+pub fn add_position(x: BurnTensor<4>, lut: BurnTensor<1>, reuse: bool) -> Option<BurnTensor<4>> {
     let shape = x.dims();
-    register(x, vec![], vec![lut], 0, shape, false)
+    register(
+        x,
+        vec![],
+        vec![lut],
+        if reuse { 9 } else { 0 },
+        shape,
+        false,
+    )
 }
 
 pub fn rope(x: BurnTensor<4>, lut: BurnTensor<1>, pos: BurnTensor<1>) -> Option<BurnTensor<4>> {
@@ -448,7 +632,37 @@ pub fn inverse_haar_add_pair(
     )
 }
 
-pub fn smooth_nhwc(x: BurnTensor<4>, weights_1d: BurnTensor<1>) -> Option<BurnTensor<4>> {
-    let h = register(x, vec![], vec![weights_1d.clone()], 4, [1, 256, 512, 512], false)?;
-    register(h, vec![], vec![weights_1d], 5, [1, 512, 512, 256], false)
+pub fn smooth_nhwc(
+    x: BurnTensor<4>,
+    weights_1d: BurnTensor<1>,
+    tiled: bool,
+    foreground: Option<BurnTensor<1>>,
+) -> Option<BurnTensor<4>> {
+    let h = register(
+        x,
+        vec![],
+        vec![weights_1d.clone()],
+        if tiled { 8 } else { 4 },
+        [1, 256, 512, 512],
+        false,
+    )?;
+    if let Some(pixels) = foreground {
+        let count = pixels.dims()[0];
+        return register(
+            h,
+            vec![],
+            vec![weights_1d, pixels],
+            7,
+            [1, 1, count, 256],
+            false,
+        );
+    }
+    register(
+        h,
+        vec![],
+        vec![weights_1d],
+        if tiled { 6 } else { 5 },
+        [1, 512, 512, 256],
+        false,
+    )
 }

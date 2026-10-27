@@ -53,8 +53,8 @@ impl Network {
             .ops
             .w::<1>(&format!("{p}.ls2.gamma"))
             .reshape([1, 1, c]);
-        let step =
-            ((self.ops.inflight_mib * 1024 * 1024 / (b.max(1) * c * 16)) / 512 * 512).clamp(512, 4096);
+        let step = ((self.ops.inflight_mib * 1024 * 1024 / (b.max(1) * c * 16)) / 512 * 512)
+            .clamp(512, 4096);
         if n <= step {
             let y = self.ops.norm(x.clone(), &format!("{p}.norm2"), eps);
             let y = activation::gelu(self.ops.linear(y, &format!("{p}.mlp.fc1")));
@@ -70,15 +70,24 @@ impl Network {
             x
         };
         let mut chunks = Vec::with_capacity(pad_n / step);
+        let mut output = self
+            .ops
+            .memory_optimizations
+            .then(|| Tensor::<3>::empty([b, pad_n, c], self.ops.options()));
         for start in (0..pad_n).step_by(step) {
             let end = start + step;
             let orig = x_pad.clone().slice([0..b, start..end, 0..c]);
             let y = self.ops.norm(orig.clone(), &format!("{p}.norm2"), eps);
             let y = activation::gelu(self.ops.linear(y, &format!("{p}.mlp.fc1")));
             let y = self.ops.linear(y, &format!("{p}.mlp.fc2")) * ls2.clone();
-            chunks.push(orig + y);
+            let chunk = orig + y;
+            if let Some(out) = output.take() {
+                output = Some(out.slice_assign([0..b, start..end, 0..c], chunk));
+            } else {
+                chunks.push(chunk);
+            }
         }
-        let out = Tensor::cat(chunks, 1);
+        let out = output.unwrap_or_else(|| Tensor::cat(chunks, 1));
         if pad_n > n {
             out.slice([0..b, 0..n, 0..c])
         } else {
@@ -104,6 +113,10 @@ impl Network {
             );
         }
         let mut chunks = Vec::with_capacity(b.div_ceil(batch));
+        let mut output = self
+            .ops
+            .memory_optimizations
+            .then(|| Tensor::<3>::empty([b, n, c], self.ops.options()));
         for start in (0..b).step_by(batch) {
             let end = (start + batch).min(b);
             let count = end - start;
@@ -127,14 +140,19 @@ impl Network {
                 )
             };
             let y = self.block(slice_x, p, Some((&key, &pos_vec)), 1e-5);
-            chunks.push(if count < batch {
+            let chunk = if count < batch {
                 y.slice([0..count, 0..n, 0..c])
             } else {
                 y
-            });
+            };
+            if let Some(out) = output.take() {
+                output = Some(out.slice_assign([start..end, 0..n, 0..c], chunk));
+            } else {
+                chunks.push(chunk);
+            }
             self.ops.boundary();
         }
-        Tensor::cat(chunks, 0)
+        output.unwrap_or_else(|| Tensor::cat(chunks, 0))
     }
 
     fn dino(&self, input: Tensor<4>) -> Tensor<3> {
@@ -167,11 +185,16 @@ impl Network {
     // Return four CPU-backed [stream, 384, 64, 64] pre-normalized spatial feature stages.
     fn backbone(&self, streams: &[Packed], branch: &str) -> Vec<Packed> {
         let _timer = self.ops.span("backbone");
+        let _branch_timer = self.ops.span(&format!("backbone/{branch}"));
         let n = streams.len();
-        crate::progress::message(format!("  [{branch}] running DINO backbone on {n} streams..."));
+        crate::progress::message(format!(
+            "  [{branch}] running DINO backbone on {n} streams..."
+        ));
         let needs_resize = streams.first().is_some_and(|s| s.len() == 3 * 512 * 512);
         let batch_size = self.encoder_batch.max(1);
         let mut dino_chunks = Vec::with_capacity(n.div_ceil(batch_size));
+        let mut dino_output = (self.ops.memory_optimizations && n > batch_size)
+            .then(|| Tensor::<3>::empty([n, 1031, 384], self.ops.options()));
         for start in (0..n).step_by(batch_size) {
             let end = (start + batch_size).min(n);
             let count = end - start;
@@ -196,14 +219,21 @@ impl Network {
                 data.into_tensor([batch_size, 3, 256, 256], &self.ops.device)
             };
             let y = self.dino(batch_input);
-            dino_chunks.push(if count < batch_size {
+            let chunk = if count < batch_size {
                 y.slice([0..count, 0..1031, 0..384])
             } else {
                 y
-            });
+            };
+            if let Some(out) = dino_output.take() {
+                dino_output = Some(out.slice_assign([start..end, 0..1031, 0..384], chunk));
+            } else {
+                dino_chunks.push(chunk);
+            }
             self.ops.boundary();
         }
-        let mut x = if dino_chunks.len() == 1 {
+        let mut x = if let Some(out) = dino_output {
+            out
+        } else if dino_chunks.len() == 1 {
             dino_chunks.pop().unwrap()
         } else {
             Tensor::cat(dino_chunks, 0)
@@ -427,7 +457,8 @@ impl Network {
         b01: Tensor<4>,
         b23: Tensor<4>,
         canonical_small: Tensor<4>,
-    ) -> Tensor<4> {
+        foreground: Option<Tensor<1>>,
+    ) -> (Tensor<4>, bool) {
         let _timer = self.ops.span("smooth");
         if !self.ops.reference_kernels {
             let weights_1d = self.ops.constant("gaussian/1d/21".into(), || {
@@ -446,8 +477,14 @@ impl Network {
                 b23.clone(),
                 canonical_small.clone(),
             ) {
-                if let Some(nhwc) = crate::geometry::smooth_nhwc(combined, weights_1d) {
-                    return nhwc;
+                let compact = foreground.is_some();
+                if let Some(nhwc) = crate::geometry::smooth_nhwc(
+                    combined,
+                    weights_1d,
+                    self.ops.memory_optimizations,
+                    foreground,
+                ) {
+                    return (nhwc, compact);
                 }
             }
         }
@@ -460,10 +497,10 @@ impl Network {
         let canonical = self.ops.resize(canonical_small, 512, true);
         let x = self.inverse(bands);
         let x = self.smooth(x + canonical);
-        x.permute([0, 2, 3, 1])
+        (x.permute([0, 2, 3, 1]), false)
     }
 
-    pub fn encode(&self, images: &[Packed]) -> Vec<Packed> {
+    pub fn encode(&self, images: &[Packed], foreground: &[usize]) -> Vec<Packed> {
         let _timer = self.ops.span("encoder");
         let n_lights = images.len();
         let stages = self.backbone(images, "canonical");
@@ -475,16 +512,17 @@ impl Network {
         let c_stride = 256 * 256 * 256;
         let mut canonical_256 = Packed::empty(self.ops.dtype, n_lights * c_stride);
         for f in (0..n_lights).step_by(2) {
+            let _light_timer = self.ops.span("canonical/fusion_and_readback");
             let s1 = (f + 1).min(n_lights - 1);
             let pair = self.fusion_pair(&stages, f, s1);
             if f + 1 < n_lights {
                 canonical_256.append(self.ops.capture(pair));
             } else {
-                canonical_256
-                    .append(self.ops.capture(pair.slice([0..1, 0..256, 0..256, 0..256])));
+                canonical_256.append(self.ops.capture(pair.slice([0..1, 0..256, 0..256, 0..256])));
             }
         }
         drop(stages);
+        let wavelet_timer = self.ops.span("wavelet/cpu_transform");
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -494,21 +532,36 @@ impl Network {
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             for chunk in images.chunks(chunk_size) {
-                handles.push(s.spawn(move || {
-                    chunk.iter().flat_map(wavelet).collect::<Vec<_>>()
-                }));
+                handles.push(s.spawn(move || chunk.iter().flat_map(wavelet).collect::<Vec<_>>()));
             }
             for h in handles {
                 wavelets.extend(h.join().expect("wavelet worker panicked"));
             }
         });
+        drop(wavelet_timer);
         let stages = self.backbone(&wavelets, "wavelet");
         drop(wavelets);
         crate::progress::message(format!(
             "  [wavelet] running fusion, inverse Haar & Gaussian smoothing ({n_lights} lights)..."
         ));
         let mut result = Vec::with_capacity(n_lights);
+        // This changes only the storage representation, after all spatial arithmetic.
+        // Indices are in raster order; decoder shuffles and context groups stay unchanged.
+        let compact = self.ops.memory_optimizations && foreground.len() < 512 * 512;
+        let indices = compact.then(|| {
+            self.ops
+                .indices(foreground.iter().map(|&i| i as i64).collect())
+        });
+        let gaussian_indices = (compact && !self.ops.reference_kernels).then(|| {
+            crate::host::upload(
+                foreground.iter().map(|&i| i as f32).collect(),
+                [foreground.len()],
+                &self.ops.device,
+                FloatDType::F32,
+            )
+        });
         for f in 0..n_lights {
+            let _light_timer = self.ops.span("wavelet/fusion_smooth_and_readback");
             let b01 = self.fusion_pair(&stages, f * 4, f * 4 + 1);
             let b23 = self.fusion_pair(&stages, f * 4 + 2, f * 4 + 3);
             let can_off = f * c_stride;
@@ -517,21 +570,35 @@ impl Network {
                 [1, 256, 256, 256],
                 &self.ops.device,
             );
-            let nhwc = self.smooth_nhwc_fast(b01, b23, canonical_small);
+            let (nhwc, already_compact) =
+                self.smooth_nhwc_fast(b01, b23, canonical_small, gaussian_indices.clone());
             // Pixel-major host layout makes sample gathering contiguous across channels.
-            result.push(self.ops.capture(nhwc));
+            if already_compact {
+                result.push(self.ops.capture(nhwc));
+            } else if let Some(indices) = &indices {
+                let _gather_timer = self.ops.span("foreground/gather_and_readback");
+                let dense = nhwc.reshape([512 * 512, 256]);
+                let mut packed = Packed::empty(self.ops.dtype, foreground.len() * 256);
+                let bytes = if self.ops.dtype == FloatDType::F32 {
+                    4
+                } else {
+                    2
+                };
+                let chunk = 8 * 1024 * 1024 / (256 * bytes);
+                for start in (0..foreground.len()).step_by(chunk) {
+                    let end = (start + chunk).min(foreground.len());
+                    let selected = dense.clone().select(0, indices.clone().slice([start..end]));
+                    packed.append(self.ops.capture(selected));
+                }
+                result.push(packed);
+            } else {
+                result.push(self.ops.capture(nhwc));
+            }
         }
         result
     }
 
-    fn mab(
-        &self,
-        x: Tensor<3>,
-        y: Tensor<3>,
-        p: &str,
-        normal: bool,
-        valid_m: usize,
-    ) -> Tensor<3> {
+    fn mab(&self, x: Tensor<3>, y: Tensor<3>, p: &str, normal: bool, valid_m: usize) -> Tensor<3> {
         let [b, n, _] = x.dims();
         let m = y.dims()[1];
         let x = if self.ops.has(&format!("{p}.ln0.weight")) {
@@ -629,7 +696,13 @@ impl Network {
             .w::<3>("glc_aggregation.aggregation.dec.0.S")
             .expand([pad_pixels, 1, 384]);
         x = self
-            .mab(seed, x, "glc_aggregation.aggregation.dec.0.mab", true, n_lights)
+            .mab(
+                seed,
+                x,
+                "glc_aggregation.aggregation.dec.0.mab",
+                true,
+                n_lights,
+            )
             .reshape([1, pad_pixels, 384]);
         for i in 0..2 {
             x = self.mab(

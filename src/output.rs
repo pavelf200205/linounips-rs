@@ -1,6 +1,64 @@
 use crate::input::Input;
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use std::path::Path;
+
+/// Compare decoded data rather than compressed file bytes or visually rounded PNGs.
+/// EXR is required so a PNG-only match cannot conceal floating-point differences.
+pub fn compare(reference: &Path, candidate: &Path) -> Result<()> {
+    let files = |dir: &Path| -> Result<std::collections::BTreeSet<String>> {
+        let mut names = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file()
+                && matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("exr" | "png")
+                )
+            {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(names)
+    };
+    let names = files(reference)?;
+    ensure!(
+        names.iter().any(|n| n.ends_with(".exr")),
+        "Reference must contain EXR outputs for exact float comparison"
+    );
+    ensure!(names == files(candidate)?, "Output file sets differ");
+    let mut failed = false;
+    for name in names {
+        let a = image::open(reference.join(&name))
+            .with_context(|| format!("Decode reference {name}"))?;
+        let b = image::open(candidate.join(&name))
+            .with_context(|| format!("Decode candidate {name}"))?;
+        ensure!(
+            a.width() == b.width() && a.height() == b.height() && a.color() == b.color(),
+            "Image shape/type differs: {name}"
+        );
+        let differences = if name.ends_with(".exr") {
+            let a = a.to_rgba32f();
+            let b = b.to_rgba32f();
+            a.as_raw()
+                .iter()
+                .zip(b.as_raw())
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count()
+        } else {
+            a.as_bytes()
+                .iter()
+                .zip(b.as_bytes())
+                .filter(|(x, y)| x != y)
+                .count()
+        };
+        println!("{name}: {differences} unequal components");
+        failed |= differences != 0;
+    }
+    ensure!(!failed, "Output equality FAILED (zero tolerance)");
+    println!("All decoded outputs are identical.");
+    Ok(())
+}
 
 pub struct Map {
     pub name: String,

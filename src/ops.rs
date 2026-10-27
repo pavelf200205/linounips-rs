@@ -17,11 +17,16 @@ pub struct Ops {
     pub score_mib: usize,
     pub reference_kernels: bool,
     pub inflight_mib: usize,
+    pub memory_optimizations: bool,
+    pub profile_sync: bool,
+    readback_bytes: Cell<u64>,
+    readback_calls: Cell<u64>,
+    pool_peak: Cell<(u64, u64)>,
     pending_bytes: Cell<usize>,
     pending_ops: Cell<usize>,
     constants: RefCell<HashMap<String, Tensor<1>>>,
     constant_bytes: Cell<usize>,
-    timings: RefCell<BTreeMap<&'static str, (u64, f64)>>,
+    timings: RefCell<BTreeMap<String, (u64, f64)>>,
     weights: HashMap<String, (Vec<usize>, Tensor<1>)>,
 }
 
@@ -199,8 +204,8 @@ impl Ops {
         if let (Some((_, s_t)), Some((_, w_t))) =
             (weights.get(seed_key).cloned(), weights.remove(fc_q_key))
         {
-            let q_seed = module::linear(s_t.reshape([1, 384]), w_t.reshape([384, 384]), None)
-                .reshape([384]);
+            let q_seed =
+                module::linear(s_t.reshape([1, 384]), w_t.reshape([384, 384]), None).reshape([384]);
             weights.insert(
                 "glc_aggregation.aggregation.dec.0.S_q".into(),
                 (vec![1, 1, 384], q_seed),
@@ -214,6 +219,11 @@ impl Ops {
             weights,
             reference_kernels: false,
             inflight_mib: 64,
+            memory_optimizations: true,
+            profile_sync: false,
+            readback_bytes: Cell::new(0),
+            readback_calls: Cell::new(0),
+            pool_peak: Cell::new((0, 0)),
             pending_bytes: Cell::new(0),
             pending_ops: Cell::new(0),
             constants: RefCell::new(HashMap::new()),
@@ -241,6 +251,9 @@ impl Ops {
         let [b, n, c] = x.dims();
         let w: Tensor<2> = self.w(&format!("{p}.weight"));
         let o = w.dims()[1];
+        let _detail = self
+            .profile_sync
+            .then(|| self.span(&format!("linear/{p}/{b}x{n}x{c}x{o}")));
         let bias_key = format!("{p}.bias");
         let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
         module::linear(x.reshape([b * n, c]), w, bias).reshape([b, n, o])
@@ -256,6 +269,7 @@ impl Ops {
                 self.w::<1>(&weight_key),
                 self.w::<1>(&bias_key),
                 eps,
+                self.memory_optimizations,
             ) {
                 return out;
             }
@@ -317,6 +331,9 @@ impl Ops {
 
     pub fn conv(&self, x: Tensor<4>, p: &str, stride: usize, pad: usize) -> Tensor<4> {
         let _timer = self.span("conv");
+        let _detail = self
+            .profile_sync
+            .then(|| self.span(&format!("conv/{p}/{:?}/s{stride}", x.dims())));
         let bias_key = format!("{p}.bias");
         let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
         module::conv2d(
@@ -376,6 +393,9 @@ impl Ops {
         let _timer = self.span("attention");
         let [b, h, n, d] = q.dims();
         let m = k.dims()[2];
+        let _detail = self
+            .profile_sync
+            .then(|| self.span(&format!("attention/{b}x{h}x{n}x{m}x{d}/valid{valid_m}")));
         if !self.reference_kernels && m <= 64 && valid_m == m {
             if let Some(out) =
                 crate::fast_attention::forward(q.clone(), k.clone(), v.clone(), scale)
@@ -412,7 +432,12 @@ impl Ops {
                     q.clone()
                 };
                 let scores = q_pad.matmul(kt_pad.clone());
-                if let Some(probs) = crate::fast_attention::scale_softmax(scores, scale, valid_m) {
+                if let Some(probs) = crate::fast_attention::scale_softmax(
+                    scores,
+                    scale,
+                    valid_m,
+                    self.memory_optimizations,
+                ) {
                     let out = probs.matmul(v_pad.clone());
                     let out = if pad_n_32 > n {
                         out.slice([0..bh, 0..n, 0..d])
@@ -455,6 +480,9 @@ impl Ops {
                     q.clone()
                 };
                 let mut head_groups = Vec::with_capacity(bh.div_ceil(bs));
+                let mut output = self
+                    .memory_optimizations
+                    .then(|| Tensor::<3>::empty([bh, n, d], self.options()));
                 let mut ok = true;
                 for bi in (0..bh).step_by(bs) {
                     let be = (bi + bs).min(bh);
@@ -465,10 +493,24 @@ impl Ops {
                         let qe = qi + qs;
                         let qq = q_pad.clone().slice([bi..be, qi..qe, 0..d]);
                         let scores = qq.matmul(kt_b.clone());
-                        if let Some(probs) =
-                            crate::fast_attention::scale_softmax(scores, scale, valid_m)
-                        {
-                            q_chunks.push(probs.matmul(v_b.clone()));
+                        if let Some(probs) = crate::fast_attention::scale_softmax(
+                            scores,
+                            scale,
+                            valid_m,
+                            self.memory_optimizations,
+                        ) {
+                            let chunk = probs.matmul(v_b.clone());
+                            if let Some(out) = output.take() {
+                                let end = qe.min(n);
+                                let chunk = if end < qe {
+                                    chunk.slice([0..(be - bi), 0..(end - qi), 0..d])
+                                } else {
+                                    chunk
+                                };
+                                output = Some(out.slice_assign([bi..be, qi..end, 0..d], chunk));
+                            } else {
+                                q_chunks.push(chunk);
+                            }
                         } else {
                             ok = false;
                             break;
@@ -477,16 +519,20 @@ impl Ops {
                     if !ok {
                         break;
                     }
-                    let head_out = Tensor::cat(q_chunks, 1);
-                    head_groups.push(if pad_n > n {
-                        head_out.slice([0..(be - bi), 0..n, 0..d])
-                    } else {
-                        head_out
-                    });
+                    if !self.memory_optimizations {
+                        let head_out = Tensor::cat(q_chunks, 1);
+                        head_groups.push(if pad_n > n {
+                            head_out.slice([0..(be - bi), 0..n, 0..d])
+                        } else {
+                            head_out
+                        });
+                    }
                     self.boundary();
                 }
                 if ok {
-                    let out = if head_groups.len() == 1 {
+                    let out = if let Some(out) = output {
+                        out
+                    } else if head_groups.len() == 1 {
                         head_groups.pop().unwrap()
                     } else {
                         Tensor::cat(head_groups, 0)
@@ -694,7 +740,9 @@ impl Ops {
             lut
         });
         if !self.reference_kernels {
-            if let Some(out) = crate::geometry::add_position(x.clone(), lut.clone()) {
+            if let Some(out) =
+                crate::geometry::add_position(x.clone(), lut.clone(), self.memory_optimizations)
+            {
                 return out;
             }
         }
@@ -733,8 +781,8 @@ impl Ops {
         let [b, _, n, d] = x.dims();
         let half = d / 2;
         let quarter = d / 4;
-        let maximum = max_hint
-            .unwrap_or_else(|| positions.iter().flatten().copied().max().unwrap_or(0));
+        let maximum =
+            max_hint.unwrap_or_else(|| positions.iter().flatten().copied().max().unwrap_or(0));
         let lut = self.constant(format!("rope/lut/{d}/{maximum}"), || {
             let mut v = Vec::with_capacity((maximum + 1) * d);
             for p in 0..=maximum {
@@ -810,28 +858,58 @@ impl Ops {
 
     pub fn capture<const D: usize>(&self, x: Tensor<D>) -> crate::host::Packed {
         let _timer = self.span("feature_readback");
+        let bytes =
+            x.dims().iter().product::<usize>() * if self.dtype == FloatDType::F32 { 4 } else { 2 };
+        self.readback_bytes
+            .set(self.readback_bytes.get() + bytes as u64);
+        self.readback_calls.set(self.readback_calls.get() + 1);
+        self.sample_pool();
         let data = crate::host::Packed::capture(x, self.dtype);
         self.pending_bytes.set(0);
         self.pending_ops.set(0);
         data
     }
 
-    pub fn span(&self, label: &'static str) -> Timer<'_> {
+    pub fn span(&self, label: &str) -> Timer<'_> {
+        if self.profile_sync {
+            self.device.sync().expect("profiling start completion");
+            self.sample_pool();
+        }
         Timer {
             ops: self,
-            label,
+            label: label.to_owned(),
             start: std::time::Instant::now(),
         }
     }
 
     pub fn reset_timings(&self) {
         self.timings.borrow_mut().clear();
+        self.readback_bytes.set(0);
+        self.readback_calls.set(0);
+        self.pool_peak.set((0, 0));
+    }
+
+    fn sample_pool(&self) {
+        if let Some(u) = self.device.memory_pool_usage() {
+            let (reserved, used) = self.pool_peak.get();
+            self.pool_peak.set((
+                reserved.max(u.bytes_reserved as u64),
+                used.max(u.bytes_in_use as u64),
+            ));
+        }
+    }
+
+    pub fn memory_report(&self) -> serde_json::Value {
+        let (reserved, used) = self.pool_peak.get();
+        serde_json::json!({"feature_readback_bytes": self.readback_bytes.get(), "feature_readback_calls": self.readback_calls.get(), "sampled_pool_reserved_peak_bytes": reserved, "sampled_pool_in_use_peak_bytes": used, "sampling": "readback boundaries; also span boundaries with --profile-sync; not a device VRAM high-water mark"})
     }
 
     pub fn timing_summary(&self) -> String {
         let timings = self.timings.borrow();
-        let mut list: Vec<(&'static str, u64, f64)> =
-            timings.iter().map(|(&k, &(c, s))| (k, c, s)).collect();
+        let mut list: Vec<(&str, u64, f64)> = timings
+            .iter()
+            .map(|(k, &(c, s))| (k.as_str(), c, s))
+            .collect();
         list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         list.into_iter()
             .map(|(k, c, s)| format!("{k}={s:.2}s({c})"))
@@ -857,13 +935,17 @@ impl Ops {
 
 pub struct Timer<'a> {
     ops: &'a Ops,
-    label: &'static str,
+    label: String,
     start: std::time::Instant,
 }
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
+        if self.ops.profile_sync {
+            self.ops.device.sync().expect("profiling end completion");
+            self.ops.sample_pool();
+        }
         let mut timings = self.ops.timings.borrow_mut();
-        let entry = timings.entry(self.label).or_insert((0, 0.));
+        let entry = timings.entry(self.label.clone()).or_insert((0, 0.));
         entry.0 += 1;
         entry.1 += self.start.elapsed().as_secs_f64();
     }

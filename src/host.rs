@@ -211,6 +211,7 @@ pub fn gather_samples(
     rgb_pixel_major: &[Packed],
     features: &[Packed],
     pixels: &[usize],
+    feature_rows: Option<&[usize]>,
     dtype: FloatDType,
 ) -> (Packed, Packed) {
     let n = rgb_pixel_major.len();
@@ -235,7 +236,7 @@ pub fn gather_samples(
             let mut feats = Vec::with_capacity(count * n * 256);
             for &pixel in pixels {
                 let c_off = pixel * 3;
-                let f_off = pixel * 256;
+                let f_off = feature_rows.map_or(pixel, |rows| rows[pixel]) * 256;
                 for light in 0..n {
                     colors.extend_from_slice(&rgb_slices[light][c_off..c_off + 3]);
                     feats.extend_from_slice(&feat_slices[light][f_off..f_off + 256]);
@@ -262,7 +263,7 @@ pub fn gather_samples(
             let mut feats = Vec::with_capacity(count * n * 256);
             for &pixel in pixels {
                 let c_off = pixel * 3;
-                let f_off = pixel * 256;
+                let f_off = feature_rows.map_or(pixel, |rows| rows[pixel]) * 256;
                 for light in 0..n {
                     colors.extend_from_slice(&rgb_slices[light][c_off..c_off + 3]);
                     feats.extend_from_slice(&feat_slices[light][f_off..f_off + 256]);
@@ -289,7 +290,7 @@ pub fn gather_samples(
             let mut feats = Vec::with_capacity(count * n * 256);
             for &pixel in pixels {
                 let c_off = pixel * 3;
-                let f_off = pixel * 256;
+                let f_off = feature_rows.map_or(pixel, |rows| rows[pixel]) * 256;
                 for light in 0..n {
                     colors.extend_from_slice(&rgb_slices[light][c_off..c_off + 3]);
                     feats.extend_from_slice(&feat_slices[light][f_off..f_off + 256]);

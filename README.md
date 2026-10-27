@@ -3,6 +3,26 @@
 Inference-only Rust implementation of the standard and PBR LINO-UniPS graphs,
 based on upstream revision 4ddb4113d0196b853978d2cc72de582611b01ebd.
 
+## Current memory/performance pass
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the current implementation, exact-output
+comparison procedure and timing interpretation. This pass retains arithmetic,
+precision, attention algorithms and pixel grouping; it changes feature storage,
+Gaussian memory access and intermediate buffer ownership. No Rust build or GPU
+inference was run for this pass. CPU indexing checks and formatting passed;
+actual bitwise output equality, speed and peak VRAM require your binary tests.
+
+New options: `--legacy-memory-path` restores the previous memory paths for A/B
+comparison; `--profile-sync` adds diagnostic synchronization and convolution-shape
+timings. Do not use synchronized profiling runs to measure production throughput.
+`lino compare --reference OLD_OUTPUT_DIR --candidate NEW_OUTPUT_DIR` checks EXR
+floating-point bits and decoded PNG bytes with zero tolerance, without a GPU.
+
+The older implementation notes below describe earlier passes. In particular,
+current long attention uses GEMM plus softmax, not FlashAttention; dispatch counts
+now use the correct names. Optimized final features are foreground-only, and
+metadata includes per-block timings even without `--verbose`.
+
 **Initial implementation: not compiled or run against checkpoints yet.** Source
 syntax, dependency resolution and graph structure were inspected; this does not
 establish numerical parity, output quality, speed or a measured VRAM limit.
