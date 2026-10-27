@@ -19,19 +19,21 @@ if ($Runs -lt 1) { throw 'Runs must be positive.' }
 $root = [IO.Path]::GetFullPath($Out)
 New-Item -ItemType Directory -Path $root | Out-Null
 $cases = @(
-    @{Name='baseline'; Flags=@('--legacy-fast-path')},
-    @{Name='direct'; Flags=@()},
-    @{Name='direct_separate_activation'; Flags=@('--separate-conv-activation')},
-    @{Name='winograd'; Flags=@('--winograd-convolutions')},
-    @{Name='direct_window1'; Flags=@('--conv-layer-window','1')},
-    @{Name='direct_window4'; Flags=@('--conv-layer-window','4')}
+    @{Name='baseline'; Flags=@('--legacy-decoder','--no-kernel-cache')},
+    @{Name='default'; Flags=@()},
+    @{Name='no_cache'; Flags=@('--no-kernel-cache')},
+    @{Name='legacy_linears'; Flags=@('--legacy-linears')},
+    @{Name='legacy_attention'; Flags=@('--legacy-packed-attention')},
+    @{Name='legacy_pbr_heads'; Flags=@('--legacy-pbr-heads')}
 )
 if ($FullMatrix) {
     $cases += @(
-        @{Name='direct32'; Flags=@('--conv-workspace-mib','32')},
-        @{Name='direct8'; Flags=@('--conv-workspace-mib','8')},
-        @{Name='winograd8'; Flags=@('--winograd-convolutions','--conv-workspace-mib','8')},
-        @{Name='winograd32'; Flags=@('--winograd-convolutions','--conv-workspace-mib','32')},
+        @{Name='separate_pbr_projection'; Flags=@('--separate-pbr-projection')},
+        @{Name='device_padding'; Flags=@('--legacy-device-padding')},
+        @{Name='no_winograd'; Flags=@('--no-winograd')},
+        @{Name='direct_window1'; Flags=@('--conv-layer-window','1')},
+        @{Name='direct_window4'; Flags=@('--conv-layer-window','4')},
+        @{Name='workspace32'; Flags=@('--conv-workspace-mib','32')},
         @{Name='wide_fusion'; Flags=@('--wide-wavelet-fusion')},
         @{Name='mlp8192'; Flags=@('--mlp-chunk-tokens','8192')},
         @{Name='query1024'; Flags=@('--attention-query-chunk','1024')},
@@ -53,6 +55,8 @@ for ($run = 1; $run -le $Runs; $run++) {
         $arguments = @('infer','--model',$modelPath,'--data',$dataPath,'--out',$destination,
             '--mode',$Mode,'--images',"$Images",'--precision',$Precision,'--seed','42','--encoder-batch','4',
             '--pixel-batch','2048','--formats','exr,png','--no-progress') + $case.Flags
+        # Isolate case caches; round 2 reuses only that case's round-1 store.
+        $arguments += @('--kernel-cache-dir',(Join-Path $root "cache_$($case.Name)"))
         $watch = [Diagnostics.Stopwatch]::StartNew()
         & $binary @arguments *> $log
         $exitCode = $LASTEXITCODE
@@ -69,6 +73,8 @@ for ($run = 1; $run -le $Runs; $run++) {
             ProcessSeconds=$watch.Elapsed.TotalSeconds; InferenceSeconds=$metadata.inference_seconds;
             EncoderSeconds=$metadata.operation_timings.encoder.inclusive_wall_seconds;
             PoolReservedSampleBytes=$metadata.memory.sampled_pool_reserved_peak_bytes;
+            CacheProbeOK=$metadata.kernel_cache.read_write_probe_ok;
+            CacheInitialEntries=$metadata.kernel_cache.initial_entries;
             Flags=($case.Flags -join ' ')
         })
         $results | Export-Csv -LiteralPath (Join-Path $root 'summary.csv') -NoTypeInformation

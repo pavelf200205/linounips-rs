@@ -33,6 +33,16 @@ impl Packed {
         }
     }
 
+    /// Native zero padding for decoder shape buckets, before the only upload.
+    pub fn pad_to(&mut self, len: usize) {
+        assert!(len >= self.len());
+        match self {
+            Self::F16(v) => v.resize(len, half::f16::ZERO),
+            Self::BF16(v) => v.resize(len, half::bf16::ZERO),
+            Self::F32(v) => v.resize(len, 0.0),
+        }
+    }
+
     /// Zero out masked-off pixels in a planar [3, plane_len] buffer without f32 round-trips.
     pub fn zero_masked_planar(&self, mask: &[bool]) -> Self {
         let plane = mask.len();

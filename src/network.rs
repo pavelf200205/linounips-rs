@@ -1,7 +1,7 @@
 //! Released LINO graph, with CPU-backed stage features and batched per-light fusion.
 use crate::{host::Packed, ops::Ops};
 use burn::tensor::{
-    FloatDType, Tensor, activation, module,
+    FloatDType, Tensor, module,
     ops::{ConvOptions, ConvTransposeOptions},
 };
 
@@ -13,6 +13,11 @@ pub struct Network {
     pub pbr: bool,
     pub encoder_batch: usize,
     pub verbose: bool,
+}
+
+pub struct Predictions {
+    pub tensor: Tensor<3>,
+    pub maps: Vec<(String, usize)>,
 }
 
 impl Network {
@@ -62,7 +67,7 @@ impl Network {
         };
         if n <= step {
             let y = self.ops.norm(x.clone(), &format!("{p}.norm2"), eps);
-            let y = activation::gelu(self.ops.linear(y, &format!("{p}.mlp.fc1")));
+            let y = self.ops.linear_gelu(y, &format!("{p}.mlp.fc1"));
             let y = self.ops.linear(y, &format!("{p}.mlp.fc2")) * ls2;
             return x + y;
         }
@@ -83,7 +88,7 @@ impl Network {
             let end = start + step;
             let orig = x_pad.clone().slice([0..b, start..end, 0..c]);
             let y = self.ops.norm(orig.clone(), &format!("{p}.norm2"), eps);
-            let y = activation::gelu(self.ops.linear(y, &format!("{p}.mlp.fc1")));
+            let y = self.ops.linear_gelu(y, &format!("{p}.mlp.fc1"));
             let y = self.ops.linear(y, &format!("{p}.mlp.fc2")) * ls2.clone();
             let chunk = orig + y;
             if let Some(out) = output.take() {
@@ -629,7 +634,6 @@ impl Network {
 
     fn mab(&self, x: Tensor<3>, y: Tensor<3>, p: &str, normal: bool, valid_m: usize) -> Tensor<3> {
         let [b, n, _] = x.dims();
-        let m = y.dims()[1];
         let x = if self.ops.has(&format!("{p}.ln0.weight")) {
             self.ops.norm(x, &format!("{p}.ln0"), 1e-5)
         } else {
@@ -646,49 +650,38 @@ impl Network {
         };
         let c = q.dims()[2];
         let d = c / 8;
-        let kv = self
-            .ops
-            .linear(y, &format!("{p}.fc_kv"))
-            .reshape([b, m, 16, d])
-            .swap_dims(1, 2);
-        let k = kv.clone().slice([0..b, 0..8, 0..m, 0..d]);
-        let v = kv.slice([0..b, 8..16, 0..m, 0..d]);
-        let q_heads = if p == "glc_aggregation.aggregation.dec.0.mab"
-            && self.ops.has("glc_aggregation.aggregation.dec.0.S_q")
-        {
-            self.ops
-                .w::<3>("glc_aggregation.aggregation.dec.0.S_q")
-                .reshape([1, 8, 1, d])
-                .expand([b, 8, n, d])
-        } else {
-            q.clone().reshape([b, n, 8, d]).swap_dims(1, 2)
-        };
-        let a = self.ops.attention_masked(
-            q_heads,
-            k,
-            v,
+        let kv = self.ops.linear(y, &format!("{p}.fc_kv"));
+        let o = self.ops.mab_attention(
+            q,
+            kv,
+            8,
             1.0 / (if normal { c } else { d } as f64).sqrt(),
             valid_m,
         );
-        let o = q + a;
         let z = if self.ops.has(&format!("{p}.ln1.weight")) {
             self.ops.norm(o.clone(), &format!("{p}.ln1"), 1e-5)
         } else {
             o.clone()
         };
-        let z = activation::gelu(self.ops.linear(z, &format!("{p}.fc_o1")));
+        let z = self.ops.linear_gelu(z, &format!("{p}.fc_o1"));
         o + self.ops.linear(z, &format!("{p}.fc_o2"))
     }
 
-    pub fn decode(&self, rgb: Tensor<3>, features: Tensor<3>) -> Vec<(String, Tensor<3>)> {
+    pub fn decode(&self, rgb: Tensor<3>, features: Tensor<3>, pixels: usize) -> Predictions {
         let _timer = self.ops.span("decoder");
-        let [pixels, n_lights, _] = rgb.dims();
+        let [uploaded_pixels, n_lights, _] = rgb.dims();
         // Pad pixel count up to a multiple of 64 (e.g. 2031/2032 -> 2048) so all pixel batches
         // share one 64-aligned GEMM shape, while `regressor.comm.enc` masks `valid_m = pixels`.
         let pad_pixels = pixels.div_ceil(64) * 64;
-        let (rgb, features) = if pad_pixels > pixels {
-            let zr = Tensor::<3>::zeros([pad_pixels - pixels, n_lights, 3], self.ops.options());
-            let zf = Tensor::<3>::zeros([pad_pixels - pixels, n_lights, 256], self.ops.options());
+        let (rgb, features) = if pad_pixels > uploaded_pixels {
+            let zr = Tensor::<3>::zeros(
+                [pad_pixels - uploaded_pixels, n_lights, 3],
+                self.ops.options(),
+            );
+            let zf = Tensor::<3>::zeros(
+                [pad_pixels - uploaded_pixels, n_lights, 256],
+                self.ops.options(),
+            );
             (
                 Tensor::cat(vec![rgb, zr], 0),
                 Tensor::cat(vec![features, zf], 0),
@@ -697,7 +690,7 @@ impl Network {
             (rgb, features)
         };
         let rgb = self.ops.linear(
-            activation::leaky_relu(self.ops.linear(rgb, "img_embedding.0"), 0.01),
+            self.ops.linear_leaky(rgb, "img_embedding.0"),
             "img_embedding.2",
         );
         let mut x = rgb.clone() + features;
@@ -745,18 +738,55 @@ impl Network {
         if pad_pixels > pixels {
             x = x.slice([0..1, 0..pixels, 0..384]);
         }
-        let mut out = Vec::with_capacity(if self.pbr { 4 } else { 1 });
-        for (head, name) in [
+        let packed_hidden = if self.pbr && self.ops.packed_pbr_heads {
+            Some(
+                self.ops
+                    .linear_relu(x.clone(), "regressor.prediction_packed"),
+            )
+        } else {
+            None
+        };
+        if self.ops.fused_pbr_projection && !self.ops.reference_kernels {
+            if let Some(hidden) = &packed_hidden {
+                if let Some(tensor) = crate::pbr_projection::forward(
+                    hidden.clone(),
+                    self.ops.w("regressor.prediction_packed.output_weight"),
+                    self.ops.w("regressor.prediction_packed.output_bias"),
+                ) {
+                    return Predictions {
+                        tensor,
+                        maps: vec![
+                            ("normal".into(), 3),
+                            ("diffuse".into(), 3),
+                            ("roughness".into(), 1),
+                            ("metallic".into(), 1),
+                        ],
+                    };
+                }
+            }
+        }
+        let mut out: Vec<(String, Tensor<3>)> = Vec::with_capacity(if self.pbr { 4 } else { 1 });
+        for (head_index, (head, name)) in [
             ("normal", "normal"),
             ("base", "diffuse"),
             ("rough", "roughness"),
             ("metal", "metallic"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             if head != "normal" && !self.pbr {
                 continue;
             }
             let p = format!("regressor.prediction_{head}");
-            let y = activation::relu(self.ops.linear(x.clone(), &format!("{p}.regression.0")));
+            let y = if let Some(hidden) = &packed_hidden {
+                hidden
+                    .clone()
+                    .slice([0..1, 0..pixels, head_index * 192..(head_index + 1) * 192])
+            } else {
+                self.ops
+                    .linear_relu(x.clone(), &format!("{p}.regression.0"))
+            };
             let mut y = self
                 .ops
                 .linear(y, &format!("{p}.out_layer"))
@@ -767,7 +797,17 @@ impl Network {
             }
             out.push((name.into(), y));
         }
-        out
+        let maps = out
+            .iter()
+            .map(|(name, t)| (name.clone(), t.dims()[2]))
+            .collect();
+        let mut tensors: Vec<_> = out.into_iter().map(|(_, t)| t).collect();
+        let tensor = if tensors.len() == 1 {
+            tensors.pop().unwrap()
+        } else {
+            Tensor::cat(tensors, 2)
+        };
+        Predictions { tensor, maps }
     }
 }
 

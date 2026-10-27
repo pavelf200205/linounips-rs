@@ -1,5 +1,9 @@
 # Defaults and the next convolution pass
 
+This describes the preceding convolution pass. Winograd is now default-on, and
+the current combined decoder/cache upgrade is documented in
+[COMBINED_UPGRADE.md](COMBINED_UPGRADE.md).
+
 The user's `normal_01_383956ba3d4e_run2/metadata.json` records 38.3273 seconds
 inference, 27.7404 seconds in the encoder, 12,008 convolution chunks and 6,004
 chunk completion waits. The wait scopes total 17.0360 seconds and include queued

@@ -1686,8 +1686,6 @@ dependencies = [
 [[package]]
 name = "cubecl-environment"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b70895e79bd37e08e1430a7e97e2cd2a6e646114e1280b0c600112d5ace19ce"
 dependencies = [
  "async-channel",
  "backtrace",
@@ -3823,6 +3821,7 @@ dependencies = [
  "cubek",
  "half",
  "image",
+ "log",
  "safetensors 0.6.2",
  "serde_json",
 ]

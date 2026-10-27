@@ -25,6 +25,10 @@ pub struct Ops {
     pub fused_conv_activation: bool,
     pub conv_layer_window: usize,
     pub winograd_convolutions: bool,
+    pub native_linears: bool,
+    pub packed_attention: bool,
+    pub packed_pbr_heads: bool,
+    pub fused_pbr_projection: bool,
     winograd_weights: RefCell<HashMap<String, Tensor<3>>>,
     winograd_weight_bytes: Cell<usize>,
     direct_pending_layers: Cell<usize>,
@@ -55,6 +59,7 @@ impl Ops {
         dtype: FloatDType,
         score_mib: usize,
         pbr: bool,
+        pack_pbr: bool,
     ) -> Result<Self> {
         ensure!(
             device.supports_dtype(dtype),
@@ -230,6 +235,62 @@ impl Ops {
             );
         }
 
+        if pbr && pack_pbr {
+            let heads = ["normal", "base", "rough", "metal"];
+            let hidden_w: Vec<Tensor<2>> = heads
+                .iter()
+                .map(|h| {
+                    weights[&format!("regressor.prediction_{h}.regression.0.weight")]
+                        .1
+                        .clone()
+                        .reshape([384, 192])
+                })
+                .collect();
+            let hidden_b: Vec<Tensor<1>> = heads
+                .iter()
+                .map(|h| {
+                    weights[&format!("regressor.prediction_{h}.regression.0.bias")]
+                        .1
+                        .clone()
+                })
+                .collect();
+            let final_w: Vec<Tensor<2>> = heads
+                .iter()
+                .map(|h| {
+                    let (shape, t) =
+                        &weights[&format!("regressor.prediction_{h}.out_layer.weight")];
+                    t.clone().reshape([shape[0], shape[1]])
+                })
+                .collect();
+            let final_b: Vec<Tensor<1>> = heads
+                .iter()
+                .map(|h| {
+                    weights[&format!("regressor.prediction_{h}.out_layer.bias")]
+                        .1
+                        .clone()
+                })
+                .collect();
+            weights.insert(
+                "regressor.prediction_packed.weight".into(),
+                (
+                    vec![384, 768],
+                    Tensor::cat(hidden_w, 1).reshape([384 * 768]),
+                ),
+            );
+            weights.insert(
+                "regressor.prediction_packed.bias".into(),
+                (vec![768], Tensor::cat(hidden_b, 0)),
+            );
+            weights.insert(
+                "regressor.prediction_packed.output_weight".into(),
+                (vec![192, 8], Tensor::cat(final_w, 1).reshape([192 * 8])),
+            );
+            weights.insert(
+                "regressor.prediction_packed.output_bias".into(),
+                (vec![8], Tensor::cat(final_b, 0)),
+            );
+        }
+
         Ok(Self {
             gemm_convolutions: true,
             fused_resize_conv: true,
@@ -237,7 +298,11 @@ impl Ops {
             direct_convolutions: true,
             fused_conv_activation: true,
             conv_layer_window: 2,
-            winograd_convolutions: false,
+            winograd_convolutions: true,
+            native_linears: true,
+            packed_attention: true,
+            packed_pbr_heads: pack_pbr,
+            fused_pbr_projection: true,
             winograd_weights: RefCell::new(HashMap::new()),
             winograd_weight_bytes: Cell::new(0),
             direct_pending_layers: Cell::new(0),
@@ -283,6 +348,20 @@ impl Ops {
     }
 
     pub fn linear(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
+        self.linear_activated(x, p, 0)
+    }
+
+    pub fn linear_gelu(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
+        self.linear_activated(x, p, 1)
+    }
+    pub fn linear_relu(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
+        self.linear_activated(x, p, 2)
+    }
+    pub fn linear_leaky(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
+        self.linear_activated(x, p, 3)
+    }
+
+    fn linear_activated(&self, x: Tensor<3>, p: &str, act: usize) -> Tensor<3> {
         let _timer = self.span("linear");
         let [b, n, c] = x.dims();
         let w: Tensor<2> = self.w(&format!("{p}.weight"));
@@ -292,7 +371,47 @@ impl Ops {
             .then(|| self.span(&format!("linear/{p}/{b}x{n}x{c}x{o}")));
         let bias_key = format!("{p}.bias");
         let bias = self.has(&bias_key).then(|| self.w::<1>(&bias_key));
-        module::linear(x.reshape([b * n, c]), w, bias).reshape([b, n, o])
+        if self.native_linears && !self.reference_kernels {
+            if let Some(out) =
+                crate::native_linear::forward(x.clone(), w.clone(), bias.clone(), act)
+            {
+                *self.routes.borrow_mut().entry("native_linear").or_default() += 1;
+                return out;
+            }
+        }
+        let y = module::linear(x.reshape([b * n, c]), w, bias).reshape([b, n, o]);
+        match act {
+            1 => activation::gelu(y),
+            2 => activation::relu(y),
+            3 => activation::leaky_relu(y, 0.01),
+            _ => y,
+        }
+    }
+
+    pub fn mab_attention(
+        &self,
+        q: Tensor<3>,
+        kv: Tensor<3>,
+        heads: usize,
+        scale: f64,
+        valid_m: usize,
+    ) -> Tensor<3> {
+        let [b, n, c] = q.dims();
+        let m = kv.dims()[1];
+        let d = c / heads;
+        if self.packed_attention && !self.reference_kernels {
+            if let Some(out) =
+                crate::packed_attention::forward(q.clone(), kv.clone(), heads, scale, valid_m)
+            {
+                *self.routes.borrow_mut().entry("packed_mab").or_default() += 1;
+                return out;
+            }
+        }
+        let kv = kv.reshape([b, m, 2 * heads, d]).swap_dims(1, 2);
+        let k = kv.clone().slice([0..b, 0..heads, 0..m, 0..d]);
+        let v = kv.slice([0..b, heads..2 * heads, 0..m, 0..d]);
+        let qh = q.clone().reshape([b, n, heads, d]).swap_dims(1, 2);
+        q + self.attention_masked(qh, k, v, scale, valid_m)
     }
 
     pub fn norm<const D: usize>(&self, x: Tensor<D>, p: &str, eps: f64) -> Tensor<D> {
@@ -1153,7 +1272,7 @@ impl Ops {
     }
 
     pub fn experiment_report(&self) -> serde_json::Value {
-        serde_json::json!({"gemm_convolutions":self.gemm_convolutions,"fused_resize_conv":self.fused_resize_conv,"flash_attention":self.flash_attention,"wide_wavelet_fusion":self.wide_wavelet_fusion,"conv_workspace_mib":self.conv_workspace_mib,"conv_queue_depth":self.conv_queue_depth,"attention_query_chunk":self.attention_query_chunk,"mlp_chunk_tokens":self.mlp_chunk_tokens,"pool_cache_mib":self.pool_cache_mib,"direct_convolutions":self.direct_convolutions,"fused_conv_activation":self.fused_conv_activation,"conv_layer_window":self.conv_layer_window,"winograd_convolutions":self.winograd_convolutions,"winograd_cached_weight_bytes":self.winograd_weight_bytes.get(),"routes":*self.routes.borrow()})
+        serde_json::json!({"gemm_convolutions":self.gemm_convolutions,"fused_resize_conv":self.fused_resize_conv,"flash_attention":self.flash_attention,"wide_wavelet_fusion":self.wide_wavelet_fusion,"conv_workspace_mib":self.conv_workspace_mib,"conv_queue_depth":self.conv_queue_depth,"attention_query_chunk":self.attention_query_chunk,"mlp_chunk_tokens":self.mlp_chunk_tokens,"pool_cache_mib":self.pool_cache_mib,"direct_convolutions":self.direct_convolutions,"fused_conv_activation":self.fused_conv_activation,"conv_layer_window":self.conv_layer_window,"winograd_convolutions":self.winograd_convolutions,"winograd_cached_weight_bytes":self.winograd_weight_bytes.get(),"native_linears":self.native_linears,"packed_attention":self.packed_attention,"packed_pbr_heads":self.packed_pbr_heads,"fused_pbr_projection":self.fused_pbr_projection,"routes":*self.routes.borrow()})
     }
 
     pub fn timing_summary(&self) -> String {

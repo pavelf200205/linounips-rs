@@ -5,36 +5,24 @@ based on upstream revision 4ddb4113d0196b853978d2cc72de582611b01ebd.
 
 ## Current memory/performance pass
 
-GEMM convolution, fused resize/convolution and FlashAttention are now enabled by
-default, following the user's 38.33-second run and quality assessment. The next
-pass adds reusable GPU convolution workspaces and fused convolution stores.
-`--legacy-fast-path` restores the measured 38-second dispatch path.
-`--winograd-convolutions` is an additional opt-in experiment. See
-[NEXT_PERFORMANCE.md](NEXT_PERFORMANCE.md) for the changes, memory limits and
-comparison commands. This revision has not been built or run on a GPU by the agent.
+Winograd convolution is enabled by default; `--no-winograd` disables it. The
+current upgrade also enables packed short-light attention, native linear
+epilogues, packed PBR heads, CPU-side decoder padding and persistent kernel/tuning
+caches. See [COMBINED_UPGRADE.md](COMBINED_UPGRADE.md) for all switches, memory
+tradeoffs and a comparison plan requiring only one build.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the current implementation, exact-output
-comparison procedure and timing interpretation. This pass retains arithmetic,
-precision, attention algorithms and pixel grouping; it changes feature storage,
-Gaussian memory access and intermediate buffer ownership. No Rust build or GPU
-inference was run for this pass. CPU indexing checks and formatting passed;
-actual bitwise output equality, speed and peak VRAM require your binary tests.
+The user measured the preceding PBR revision at 30–33 seconds, including Winograd
+runs at 29.98 and 31.13 seconds. This source revision has not been compiled or
+run on a GPU by the agent. CPU layout/algebra checks and dependency resolution
+are available; speed, numerical agreement and peak VRAM still need binary tests.
+All lights, tokens and pixel context groups are retained. New reduction/epilogue
+paths can change floating-point rounding. No weights are bundled or downloaded.
 
-New options: `--legacy-memory-path` restores the previous memory paths for A/B
-comparison; `--profile-sync` adds diagnostic synchronization and convolution-shape
-timings. Do not use synchronized profiling runs to measure production throughput.
 `lino compare --reference OLD_OUTPUT_DIR --candidate NEW_OUTPUT_DIR` checks EXR
-floating-point bits and decoded PNG bytes with zero tolerance, without a GPU.
-
-The older implementation notes below describe earlier passes. In particular,
-current long attention uses GEMM plus softmax, not FlashAttention; dispatch counts
-now use the correct names. Optimized final features are foreground-only, and
-metadata includes per-block timings even without `--verbose`.
-
-**Initial implementation: not compiled or run against checkpoints yet.** Source
-syntax, dependency resolution and graph structure were inspected; this does not
-establish numerical parity, output quality, speed or a measured VRAM limit.
-The user performs builds and inference. No weights are bundled or downloaded.
+bits and decoded PNG bytes with zero tolerance. `--profile-sync` adds diagnostic
+synchronization and must be measured separately from normal throughput runs.
+The notes farther below also describe historical passes; the linked current
+upgrade document supersedes their implementation/default descriptions.
 
 ## Dependencies and device support
 
@@ -45,10 +33,11 @@ There are no custom CUDA-only kernels. Optional CUDA requires --features cuda.
 and precision availability depends on the backend. Auto precision prefers BF16,
 then FP16, with FP32 on CPU or devices lacking either half type.
 
-Cross-run shader/tuning persistence is disabled. As in unimsps-rs, pinned
-CubeCL's transitively enabled throughput storage is forced to its upstream RAM
-fallback by using the existing executable file as its impossible directory root.
-No vendored crates, storage patches, writable cache directory or cache CLI exist.
+Cross-run shader/tuning persistence is enabled. `--no-kernel-cache` restores RAM
+storage; `--kernel-cache-dir` selects a root. Windows defaults to
+`%LOCALAPPDATA%/lino-rs/kernel-cache`. A local cubecl-environment 0.11.0 patch
+repairs Windows database opening; its source and licenses are under vendor/.
+Metadata reports database probe results and stored artifact/tuning counts.
 
 ## Build manually
 

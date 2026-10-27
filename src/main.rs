@@ -5,14 +5,18 @@ mod flash_attention;
 mod geometry;
 mod host;
 mod input;
+mod kernel_cache;
+mod native_linear;
 mod network;
 mod ops;
 mod output;
+mod packed_attention;
+mod pbr_projection;
 mod progress;
 mod schema;
 mod winograd;
 use anyhow::{Context, Result, ensure};
-use burn::tensor::{Device, DeviceKind, FloatDType, Tensor};
+use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand, ValueEnum};
 use host::{gather_samples, read};
 use input::{Input, Rng};
@@ -97,6 +101,27 @@ struct Cli {
     /// Try F(2x2,3x3) Winograd on stride-1 convolutions; changes transform-domain rounding.
     #[arg(long, global = true)]
     winograd_convolutions: bool,
+    /// Disable the default Winograd route.
+    #[arg(long, global = true)]
+    no_winograd: bool,
+    /// Restore all decoder/projection paths from the previous upgrade.
+    #[arg(long, global = true)]
+    legacy_decoder: bool,
+    #[arg(long, global = true)]
+    legacy_linears: bool,
+    #[arg(long, global = true)]
+    legacy_packed_attention: bool,
+    #[arg(long, global = true)]
+    legacy_pbr_heads: bool,
+    #[arg(long, global = true)]
+    separate_pbr_projection: bool,
+    #[arg(long, global = true)]
+    legacy_device_padding: bool,
+    /// Disable cross-process shader and tuning persistence.
+    #[arg(long, global = true)]
+    no_kernel_cache: bool,
+    #[arg(long, global = true)]
+    kernel_cache_dir: Option<PathBuf>,
     /// Fuse all four wavelet streams together (higher live activation memory).
     #[arg(long, global = true)]
     wide_wavelet_fusion: bool,
@@ -211,25 +236,10 @@ fn main() -> Result<()> {
         cli.conv_layer_window <= 64,
         "Convolution layer window must be <=64"
     );
-    use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
-    let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
-    let executable = std::env::current_exe()?;
-    ensure!(
-        executable.is_file(),
-        "Cannot select process-local runtime storage"
-    );
-    // Pinned CubeCL's throughput storage lacks a memory-only switch. An existing
-    // file cannot be a directory; upstream falls back to RAM before opening a DB.
-    config.environment.path = CacheConfig::Directory(executable);
-    config.compilation.cache = false;
-    config.autotune.disable_cache = true;
-    config.throughput.disable_cache = false;
-    config.environment.records.level = cubecl::records::RecordLevel::Off;
-    config.environment.records.keep_sessions = Some(0);
-    ensure!(
-        CubeClRuntimeConfig::try_set(config),
-        "Runtime already initialized"
-    );
+    let kernel_cache = kernel_cache::configure(
+        cli.kernel_cache_dir.as_deref(),
+        !cli.no_kernel_cache && !cli.cpu,
+    )?;
     let device = if cli.cpu {
         Device::flex()
     } else if cli.api == "cuda" {
@@ -321,8 +331,16 @@ fn main() -> Result<()> {
         model.clone()
     };
     let pbr = matches!(mode, Mode::Pbr);
+    let pack_pbr = pbr && !cli.legacy_decoder && !cli.legacy_pbr_heads && !cli.legacy_fast_path;
     let model_load_start = Instant::now();
-    let mut ops = ops::Ops::load(&checkpoint, device, dtype, cli.score_budget_mib, pbr)?;
+    let mut ops = ops::Ops::load(
+        &checkpoint,
+        device,
+        dtype,
+        cli.score_budget_mib,
+        pbr,
+        pack_pbr,
+    )?;
     ops.reference_kernels = cli.reference_kernels;
     ops.inflight_mib = cli.inflight_mib;
     ops.memory_optimizations = !cli.legacy_memory_path;
@@ -333,7 +351,13 @@ fn main() -> Result<()> {
     ops.direct_convolutions = !cli.legacy_fast_path && !cli.legacy_conv_dispatch;
     ops.fused_conv_activation = !cli.legacy_fast_path && !cli.separate_conv_activation;
     ops.conv_layer_window = cli.conv_layer_window;
-    ops.winograd_convolutions = cli.winograd_convolutions && !cli.legacy_fast_path;
+    ops.winograd_convolutions = !cli.no_winograd && !cli.legacy_fast_path;
+    ops.native_linears = !cli.legacy_decoder && !cli.legacy_linears && !cli.legacy_fast_path;
+    ops.packed_attention =
+        !cli.legacy_decoder && !cli.legacy_packed_attention && !cli.legacy_fast_path;
+    ops.packed_pbr_heads = pack_pbr;
+    ops.fused_pbr_projection =
+        pbr && !cli.legacy_decoder && !cli.separate_pbr_projection && !cli.legacy_fast_path;
     ops.wide_wavelet_fusion = cli.wide_wavelet_fusion;
     ops.conv_workspace_mib = cli.conv_workspace_mib;
     ops.conv_queue_depth = cli.conv_queue_depth;
@@ -473,12 +497,26 @@ fn main() -> Result<()> {
                 });
                 let (colors, f) = {
                     let _timer = net.ops.span("decoder/input_upload");
+                    let mut colors = colors;
+                    let mut f = f;
+                    let uploaded = if !cli.legacy_decoder
+                        && !cli.legacy_device_padding
+                        && !cli.legacy_fast_path
+                    {
+                        count.div_ceil(64) * 64
+                    } else {
+                        count
+                    };
+                    if uploaded > count {
+                        colors.pad_to(uploaded * n * 3);
+                        f.pad_to(uploaded * n * 256);
+                    }
                     (
-                        colors.into_tensor([count, n, 3], &net.ops.device),
-                        f.into_tensor([count, n, 256], &net.ops.device),
+                        colors.into_tensor([uploaded, n, 3], &net.ops.device),
+                        f.into_tensor([uploaded, n, 256], &net.ops.device),
                     )
                 };
-                let predictions = net.decode(colors, f);
+                let predictions = net.decode(colors, f, count);
                 // Submit the current GPU work, then gather the next CPU batch while
                 // it runs. Only host buffers are double-buffered, not dense GPU maps.
                 {
@@ -498,33 +536,15 @@ fn main() -> Result<()> {
                         ));
                     }
                 }
-                if predictions.len() == 1 {
-                    let (name, tensor) = predictions.into_iter().next().unwrap();
-                    let values = {
-                        let _timer = net.ops.span("decoder/output_readback");
-                        read(tensor)
-                    };
-                    let map = maps.iter_mut().find(|m| m.name == name).unwrap();
-                    let ch = map.channels;
-                    for (i, &pixel) in set.iter().enumerate() {
-                        let y = (pixel / 512) * grid + block / grid;
-                        let x = (pixel % 512) * grid + block % grid;
-                        let dst = (y * input.size + x) * ch;
-                        map.values[dst..dst + ch].copy_from_slice(&values[i * ch..(i + 1) * ch]);
-                    }
-                } else {
-                    let meta: Vec<(String, usize)> = predictions
-                        .iter()
-                        .map(|(name, t)| (name.clone(), t.dims()[2]))
-                        .collect();
-                    let total_ch: usize = meta.iter().map(|(_, c)| *c).sum();
-                    let tensors: Vec<_> = predictions.into_iter().map(|(_, t)| t).collect();
+                {
+                    let total_ch: usize = predictions.maps.iter().map(|(_, c)| *c).sum();
                     let combined = {
                         let _timer = net.ops.span("decoder/output_readback");
-                        read(Tensor::cat(tensors, 2))
+                        read(predictions.tensor)
                     };
+                    let _scatter = net.ops.span("decoder/output_scatter");
                     let mut ch_offset = 0;
-                    for (name, ch) in meta {
+                    for (name, ch) in predictions.maps {
                         let map = maps.iter_mut().find(|m| m.name == name).unwrap();
                         for (i, &pixel) in set.iter().enumerate() {
                             let y = (pixel / 512) * grid + block / grid;
@@ -583,7 +603,14 @@ fn main() -> Result<()> {
         metadata["experimental_flash_dispatch_totals"] = flash_attention::stats();
         metadata["direct_convolution_dispatch_totals"] = conv_gemm::direct_stats();
         metadata["winograd_dispatch_totals"] = winograd::stats();
+        metadata["native_linear_dispatch_totals"] = native_linear::stats();
+        metadata["packed_mab_dispatch_total"] = serde_json::json!(packed_attention::stats());
+        metadata["pbr_projection_dispatch_total"] = serde_json::json!(pbr_projection::stats());
+        metadata["decoder_host_padding"] = serde_json::json!(
+            !cli.legacy_decoder && !cli.legacy_device_padding && !cli.legacy_fast_path
+        );
         metadata["blocks"] = serde_json::json!(profile);
+        metadata["kernel_cache"] = kernel_cache.report();
         metadata["timing_kind"] = serde_json::json!(if cli.profile_sync {
             "synchronized inclusive CPU wall time; diagnostic mode changes execution; nested spans overlap"
         } else {

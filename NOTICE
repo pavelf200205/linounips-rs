@@ -12,3 +12,7 @@ See LICENSE-APACHE. No checkpoint weights are distributed in this repository.
 
 The CLI conventions and release-helper structure follow the local unimsps-rs
 project. The neural graph is independent and does not link to unimsps-rs.
+
+The vendored cubecl-environment 0.11.0 source is from Tracel's CubeCL project,
+licensed MIT OR Apache-2.0. Its licenses and the local Windows persistence repair
+are documented in vendor/cubecl-environment/ (LINO_PATCH.md).
